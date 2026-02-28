@@ -1,0 +1,28 @@
+{
+  "name": "plugconversa-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PlugConversa MASTER API (Node + Express + PostgreSQL)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "pg": "^8.19.0",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

@@ -23,3 +23,15 @@ out/
 # Editor
 .vscode/
 .idea/
+
+# WhatsApp sessions (Baileys)
+api/whatsapp/
+api/**/whatsapp/
+**/creds.json
+**/app-state-sync-*.json
+**/pre-key-*.json
+**/sender-key-*.json
+**/sender-key-memory-*.json
+**/session-*.json
+**/device-*.json
+**/id-mapping-*.json
