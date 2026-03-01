@@ -55,6 +55,45 @@ function getDisconnectMessage(lastDisconnect) {
   );
 }
 
+function isSupportedIncomingChatJid(jid) {
+  if (!jid) return false;
+
+  // ignora broadcasts / status / newsletter / grupos
+  if (jid === "status@broadcast") return false;
+  if (jid.endsWith("@broadcast")) return false;
+  if (jid.endsWith("@g.us")) return false;
+  if (jid.endsWith("@newsletter")) return false;
+
+  // aceita usuários "normais" e LID
+  return jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid");
+}
+
+function extractContactKeyFromJid(jid) {
+  // remove sufixo e mantém apenas dígitos (se houver)
+  const raw = String(jid)
+    .replace("@s.whatsapp.net", "")
+    .replace("@lid", "")
+    .trim();
+
+  const digits = raw.replace(/\D/g, "");
+  return digits || raw;
+}
+
+function extractTextFromMessage(message) {
+  if (!message) return null;
+
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    message.documentMessage?.caption ||
+    message.buttonsResponseMessage?.selectedDisplayText ||
+    message.listResponseMessage?.title ||
+    null
+  );
+}
+
 /**
  * Retorna sessão em memória (se existir)
  */
@@ -354,16 +393,15 @@ async function startSession(tenantId, options = {}) {
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages?.[0];
     if (!msg?.message) return;
+
+    // ignorar mensagens enviadas por nós
     if (msg.key?.fromMe) return;
 
     const remoteJid = msg.key?.remoteJid || "";
-    if (!remoteJid.endsWith("@s.whatsapp.net")) return;
+    if (!isSupportedIncomingChatJid(remoteJid)) return;
 
-    const phone = remoteJid.replace("@s.whatsapp.net", "");
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      null;
+    const contactKey = extractContactKeyFromJid(remoteJid);
+    const text = extractTextFromMessage(msg.message);
 
     if (!text) return;
 
@@ -380,7 +418,7 @@ async function startSession(tenantId, options = {}) {
           AND phone = $2
         LIMIT 1
         `,
-        [t, phone]
+        [t, contactKey]
       );
 
       let contactId;
@@ -392,7 +430,7 @@ async function startSession(tenantId, options = {}) {
           VALUES ($1, $2, $3)
           RETURNING id
           `,
-          [t, phone, phone]
+          [t, contactKey, contactKey]
         );
         contactId = insert.rows[0].id;
       } else {
@@ -433,15 +471,17 @@ async function startSession(tenantId, options = {}) {
         conversationId = convResult.rows[0].id;
       }
 
+      // ✅ incoming deve ser direction='in'
       await client.query(
         `
         INSERT INTO messages (
           tenant_id,
           conversation_id,
+          direction,
           sender_type,
           content
         )
-        VALUES ($1, $2, 'contact', $3)
+        VALUES ($1, $2, 'in', 'contact', $3)
         `,
         [t, conversationId, String(text)]
       );
