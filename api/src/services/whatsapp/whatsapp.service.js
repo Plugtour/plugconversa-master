@@ -539,40 +539,20 @@ async function startSession(tenantId, options = {}) {
         }
       }
 
-      // 2) conversation
-      const convResult = await client.query(
+      // 2) conversation (sem status / respeita UNIQUE tenant_id+contact_id)
+      const convUpsert = await client.query(
         `
-        SELECT id
-        FROM conversations
-        WHERE tenant_id = $1
-          AND contact_id = $2
-          AND status = 'open'
-        ORDER BY last_message_at DESC NULLS LAST, id DESC
-        LIMIT 1
+        INSERT INTO conversations (tenant_id, contact_id, last_message_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (tenant_id, contact_id)
+        DO UPDATE SET last_message_at = NOW(),
+                      updated_at = NOW()
+        RETURNING id
         `,
         [t, contactId]
       );
 
-      let conversationId;
-
-      if (convResult.rowCount === 0) {
-        const insertConv = await client.query(
-          `
-          INSERT INTO conversations (
-            tenant_id,
-            contact_id,
-            status,
-            last_message_at
-          )
-          VALUES ($1, $2, 'open', NOW())
-          RETURNING id
-          `,
-          [t, contactId]
-        );
-        conversationId = insertConv.rows[0].id;
-      } else {
-        conversationId = convResult.rows[0].id;
-      }
+      const conversationId = convUpsert.rows[0].id;
 
       // 3) message
       await client.query(
@@ -586,18 +566,6 @@ async function startSession(tenantId, options = {}) {
         VALUES ($1, $2, 'contact', $3)
         `,
         [t, conversationId, String(text)]
-      );
-
-      // 4) last_message_at
-      await client.query(
-        `
-        UPDATE conversations
-        SET last_message_at = NOW(),
-            updated_at = NOW()
-        WHERE tenant_id = $1
-          AND id = $2
-        `,
-        [t, conversationId]
       );
 
       await client.query("COMMIT");
