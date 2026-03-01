@@ -55,43 +55,58 @@ function getDisconnectMessage(lastDisconnect) {
   );
 }
 
-function isSupportedIncomingChatJid(jid) {
-  if (!jid) return false;
-
-  // ignora broadcasts / status / newsletter / grupos
-  if (jid === "status@broadcast") return false;
-  if (jid.endsWith("@broadcast")) return false;
-  if (jid.endsWith("@g.us")) return false;
-  if (jid.endsWith("@newsletter")) return false;
-
-  // aceita usuários "normais" e LID
-  return jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid");
-}
-
-function extractContactKeyFromJid(jid) {
-  // remove sufixo e mantém apenas dígitos (se houver)
-  const raw = String(jid)
-    .replace("@s.whatsapp.net", "")
-    .replace("@lid", "")
-    .trim();
-
-  const digits = raw.replace(/\D/g, "");
-  return digits || raw;
-}
-
-function extractTextFromMessage(message) {
+/**
+ * Unwrap: algumas mensagens vêm embrulhadas (ephemeral/viewOnce)
+ */
+function unwrapMessageContainer(message) {
   if (!message) return null;
 
-  return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
-    message.documentMessage?.caption ||
-    message.buttonsResponseMessage?.selectedDisplayText ||
-    message.listResponseMessage?.title ||
-    null
-  );
+  // ephemeral
+  if (message.ephemeralMessage?.message) {
+    return unwrapMessageContainer(message.ephemeralMessage.message);
+  }
+
+  // viewOnce (pode ter variações)
+  if (message.viewOnceMessage?.message) {
+    return unwrapMessageContainer(message.viewOnceMessage.message);
+  }
+  if (message.viewOnceMessageV2?.message) {
+    return unwrapMessageContainer(message.viewOnceMessageV2.message);
+  }
+  if (message.viewOnceMessageV2Extension?.message) {
+    return unwrapMessageContainer(message.viewOnceMessageV2Extension.message);
+  }
+
+  return message;
+}
+
+/**
+ * Extrai texto/caption do conteúdo recebido
+ */
+function extractTextFromMessage(message) {
+  const m = unwrapMessageContainer(message);
+  if (!m) return null;
+
+  // texto simples
+  if (m.conversation) return String(m.conversation);
+
+  // texto estendido
+  if (m.extendedTextMessage?.text) return String(m.extendedTextMessage.text);
+
+  // mídia com legenda
+  if (m.imageMessage?.caption) return String(m.imageMessage.caption);
+  if (m.videoMessage?.caption) return String(m.videoMessage.caption);
+  if (m.documentMessage?.caption) return String(m.documentMessage.caption);
+
+  // alguns clientes enviam "buttonsResponseMessage" etc.
+  if (m.buttonsResponseMessage?.selectedDisplayText)
+    return String(m.buttonsResponseMessage.selectedDisplayText);
+
+  if (m.listResponseMessage?.title) return String(m.listResponseMessage.title);
+  if (m.templateButtonReplyMessage?.selectedDisplayText)
+    return String(m.templateButtonReplyMessage.selectedDisplayText);
+
+  return null;
 }
 
 /**
@@ -204,15 +219,12 @@ async function startSession(tenantId, options = {}) {
     logger,
     printQRInTerminal: String(process.env.WA_PRINT_QR || "0") === "1",
     browser: ["PlugConversa", "Chrome", "1.0.0"],
-    // ajuda a reduzir ruído / problemas de preview
     generateHighQualityLinkPreview: false,
   });
 
   sock.ev.on("creds.update", async () => {
     try {
       await saveCreds();
-      // log leve, sem spam
-      // log(t, "creds.update => credenciais salvas");
     } catch (e) {
       logErr(t, "creds.update => falha ao salvar credenciais:", e?.message || e);
     }
@@ -265,7 +277,6 @@ async function startSession(tenantId, options = {}) {
   sock.ev.on("connection.update", async (update) => {
     const { connection, qr, lastDisconnect, isNewLogin } = update || {};
 
-    // log diagnóstico (sem esconder erro)
     try {
       if (typeof isNewLogin !== "undefined") {
         log(t, "connection.update => isNewLogin:", isNewLogin);
@@ -282,9 +293,7 @@ async function startSession(tenantId, options = {}) {
         entry.lastDisconnectMessage = msg;
         log(t, "lastDisconnect => statusCode:", code, "message:", msg);
       }
-    } catch (e) {
-      // não deixa quebrar o handler
-    }
+    } catch (e) {}
 
     try {
       // QR novo
@@ -322,7 +331,6 @@ async function startSession(tenantId, options = {}) {
         );
 
         log(t, "connected => status atualizado no banco");
-
         return;
       }
 
@@ -350,7 +358,6 @@ async function startSession(tenantId, options = {}) {
           isLoggedOut,
         });
 
-        // limpa sessão atual
         try {
           if (entry.reconnectTimer) {
             clearTimeout(entry.reconnectTimer);
@@ -365,13 +372,12 @@ async function startSession(tenantId, options = {}) {
           return;
         }
 
-        // reconexão com backoff simples
         const nextAttempts = (entry.reconnectAttempts || 0) + 1;
         const delayMs = Math.min(2000 * nextAttempts, 15000);
 
         log(t, `reconnect => tentativa #${nextAttempts} em ${delayMs}ms`);
 
-        const timer = setTimeout(() => {
+        setTimeout(() => {
           startSession(t)
             .then((newEntry) => {
               if (newEntry) newEntry.reconnectAttempts = nextAttempts;
@@ -381,8 +387,6 @@ async function startSession(tenantId, options = {}) {
             });
         }, delayMs);
 
-        // não temos mais "entry" no map (foi delete), mas mantemos timer local
-        // se quiser observar isso no futuro, dá pra persistir em memória por outro map
         return;
       }
     } catch (err) {
@@ -390,20 +394,67 @@ async function startSession(tenantId, options = {}) {
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
+  /**
+   * ✅ DIAGNÓSTICO DE ENTRADA
+   * - loga SEMPRE que chegar message upsert
+   * - mostra remoteJid, fromMe, tipo e chaves de message
+   */
+  sock.ev.on("messages.upsert", async (payload) => {
+    const { messages, type } = payload || {};
     const msg = messages?.[0];
-    if (!msg?.message) return;
 
-    // ignorar mensagens enviadas por nós
-    if (msg.key?.fromMe) return;
+    // log bruto para saber se chega
+    try {
+      const remoteJid = msg?.key?.remoteJid;
+      const fromMe = msg?.key?.fromMe;
+      const pushName = msg?.pushName;
+      const messageKeys = msg?.message ? Object.keys(msg.message) : [];
+      log(t, "messages.upsert => RECEBIDO", {
+        type,
+        remoteJid,
+        fromMe,
+        pushName,
+        messageKeys,
+      });
+    } catch (e) {}
+
+    if (!msg?.message) {
+      log(t, "messages.upsert => ignorado: sem msg.message");
+      return;
+    }
+
+    // ignora mensagens enviadas por nós
+    if (msg.key?.fromMe) {
+      log(t, "messages.upsert => ignorado: fromMe=true");
+      return;
+    }
 
     const remoteJid = msg.key?.remoteJid || "";
-    if (!isSupportedIncomingChatJid(remoteJid)) return;
 
-    const contactKey = extractContactKeyFromJid(remoteJid);
+    // ignore status broadcast
+    if (remoteJid === "status@broadcast") {
+      log(t, "messages.upsert => ignorado: status@broadcast");
+      return;
+    }
+
+    // por enquanto vamos salvar só conversas privadas
+    if (!remoteJid.endsWith("@s.whatsapp.net")) {
+      log(t, "messages.upsert => ignorado: não é @s.whatsapp.net", { remoteJid });
+      return;
+    }
+
+    const phone = remoteJid.replace("@s.whatsapp.net", "");
+
     const text = extractTextFromMessage(msg.message);
 
-    if (!text) return;
+    if (!text) {
+      // loga tipo real quando não tem texto
+      const keys = Object.keys(unwrapMessageContainer(msg.message) || {});
+      log(t, "messages.upsert => sem texto (provável mídia/ação)", { keys });
+      return;
+    }
+
+    log(t, "messages.upsert => texto extraído", { phone, text: String(text).slice(0, 80) });
 
     const client = await pool.connect();
 
@@ -418,7 +469,7 @@ async function startSession(tenantId, options = {}) {
           AND phone = $2
         LIMIT 1
         `,
-        [t, contactKey]
+        [t, phone]
       );
 
       let contactId;
@@ -430,7 +481,7 @@ async function startSession(tenantId, options = {}) {
           VALUES ($1, $2, $3)
           RETURNING id
           `,
-          [t, contactKey, contactKey]
+          [t, phone, phone]
         );
         contactId = insert.rows[0].id;
       } else {
@@ -471,17 +522,15 @@ async function startSession(tenantId, options = {}) {
         conversationId = convResult.rows[0].id;
       }
 
-      // ✅ incoming deve ser direction='in'
       await client.query(
         `
         INSERT INTO messages (
           tenant_id,
           conversation_id,
-          direction,
           sender_type,
           content
         )
-        VALUES ($1, $2, 'in', 'contact', $3)
+        VALUES ($1, $2, 'contact', $3)
         `,
         [t, conversationId, String(text)]
       );
@@ -498,6 +547,7 @@ async function startSession(tenantId, options = {}) {
       );
 
       await client.query("COMMIT");
+      log(t, "messages.upsert => SALVO NO BANCO", { phone });
     } catch (err) {
       try {
         await client.query("ROLLBACK");
@@ -507,6 +557,9 @@ async function startSession(tenantId, options = {}) {
       client.release();
     }
   });
+
+  // ✅ ALTERAÇÃO NECESSÁRIA: confirma no log que ESTE arquivo foi carregado e o listener foi registrado
+  log(t, "messages.upsert listener REGISTRADO (diagnóstico)");
 
   return entry;
 }
