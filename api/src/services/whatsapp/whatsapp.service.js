@@ -437,24 +437,37 @@ async function startSession(tenantId, options = {}) {
       return;
     }
 
-    // por enquanto vamos salvar só conversas privadas
-    if (!remoteJid.endsWith("@s.whatsapp.net")) {
-      log(t, "messages.upsert => ignorado: não é @s.whatsapp.net", { remoteJid });
+    // ✅ CORREÇÃO: WhatsApp pode vir como @s.whatsapp.net OU @lid (conversas privadas)
+    const isPrivateSwa = remoteJid.endsWith("@s.whatsapp.net");
+    const isPrivateLid = remoteJid.endsWith("@lid");
+
+    // por enquanto vamos salvar só conversas privadas (sem grupos)
+    if (!isPrivateSwa && !isPrivateLid) {
+      log(t, "messages.upsert => ignorado: não é conversa privada suportada", { remoteJid });
       return;
     }
 
-    const phone = remoteJid.replace("@s.whatsapp.net", "");
+    // ✅ Identificador do contato:
+    // - @s.whatsapp.net => usa telefone
+    // - @lid => usa lid:XXXX pra não colidir com telefones
+    const contactKey = isPrivateSwa
+      ? remoteJid.replace("@s.whatsapp.net", "")
+      : `lid:${remoteJid.replace("@lid", "")}`;
 
     const text = extractTextFromMessage(msg.message);
 
     if (!text) {
       // loga tipo real quando não tem texto
       const keys = Object.keys(unwrapMessageContainer(msg.message) || {});
-      log(t, "messages.upsert => sem texto (provável mídia/ação)", { keys });
+      log(t, "messages.upsert => sem texto (provável mídia/ação)", { keys, remoteJid });
       return;
     }
 
-    log(t, "messages.upsert => texto extraído", { phone, text: String(text).slice(0, 80) });
+    log(t, "messages.upsert => texto extraído", {
+      contactKey,
+      text: String(text).slice(0, 80),
+      remoteJid,
+    });
 
     const client = await pool.connect();
 
@@ -469,7 +482,7 @@ async function startSession(tenantId, options = {}) {
           AND phone = $2
         LIMIT 1
         `,
-        [t, phone]
+        [t, contactKey]
       );
 
       let contactId;
@@ -481,7 +494,7 @@ async function startSession(tenantId, options = {}) {
           VALUES ($1, $2, $3)
           RETURNING id
           `,
-          [t, phone, phone]
+          [t, contactKey, contactKey]
         );
         contactId = insert.rows[0].id;
       } else {
@@ -547,7 +560,7 @@ async function startSession(tenantId, options = {}) {
       );
 
       await client.query("COMMIT");
-      log(t, "messages.upsert => SALVO NO BANCO", { phone });
+      log(t, "messages.upsert => SALVO NO BANCO", { contactKey, remoteJid });
     } catch (err) {
       try {
         await client.query("ROLLBACK");
