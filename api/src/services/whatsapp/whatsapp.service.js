@@ -110,6 +110,28 @@ function extractTextFromMessage(message) {
 }
 
 /**
+ * ✅ Identifica se o JID é conversa privada suportada
+ * - aceita @s.whatsapp.net (padrão)
+ * - aceita @lid (multi-device / LID)
+ */
+function isPrivateConversationJid(jid) {
+  const j = String(jid || "");
+  return j.endsWith("@s.whatsapp.net") || j.endsWith("@lid");
+}
+
+/**
+ * ✅ Extrai um identificador do contato a partir do JID
+ * - "5511999999999@s.whatsapp.net" -> "5511999999999"
+ * - "98630031659059@lid" -> "98630031659059"
+ */
+function extractContactKeyFromJid(jid) {
+  const j = String(jid || "");
+  if (j.endsWith("@s.whatsapp.net")) return j.replace("@s.whatsapp.net", "");
+  if (j.endsWith("@lid")) return j.replace("@lid", "");
+  return "";
+}
+
+/**
  * Retorna sessão em memória (se existir)
  */
 function getSession(tenantId) {
@@ -395,9 +417,8 @@ async function startSession(tenantId, options = {}) {
   });
 
   /**
-   * ✅ DIAGNÓSTICO DE ENTRADA
-   * - loga SEMPRE que chegar message upsert
-   * - mostra remoteJid, fromMe, tipo e chaves de message
+   * ✅ INCOMING (aceita @s.whatsapp.net e @lid)
+   * - salva em contacts/conversations/messages
    */
   sock.ev.on("messages.upsert", async (payload) => {
     const { messages, type } = payload || {};
@@ -437,36 +458,38 @@ async function startSession(tenantId, options = {}) {
       return;
     }
 
-    // ✅ CORREÇÃO: WhatsApp pode vir como @s.whatsapp.net OU @lid (conversas privadas)
-    const isPrivateSwa = remoteJid.endsWith("@s.whatsapp.net");
-    const isPrivateLid = remoteJid.endsWith("@lid");
-
-    // por enquanto vamos salvar só conversas privadas (sem grupos)
-    if (!isPrivateSwa && !isPrivateLid) {
-      log(t, "messages.upsert => ignorado: não é conversa privada suportada", { remoteJid });
+    // ✅ aceita @s.whatsapp.net e @lid
+    if (!isPrivateConversationJid(remoteJid)) {
+      log(t, "messages.upsert => ignorado: não é conversa privada suportada", {
+        remoteJid,
+      });
       return;
     }
 
-    // ✅ Identificador do contato:
-    // - @s.whatsapp.net => usa telefone
-    // - @lid => usa lid:XXXX pra não colidir com telefones
-    const contactKey = isPrivateSwa
-      ? remoteJid.replace("@s.whatsapp.net", "")
-      : `lid:${remoteJid.replace("@lid", "")}`;
+    const phone = extractContactKeyFromJid(remoteJid);
+
+    if (!phone) {
+      log(t, "messages.upsert => ignorado: não consegui extrair contactKey do jid", {
+        remoteJid,
+      });
+      return;
+    }
 
     const text = extractTextFromMessage(msg.message);
 
     if (!text) {
-      // loga tipo real quando não tem texto
       const keys = Object.keys(unwrapMessageContainer(msg.message) || {});
-      log(t, "messages.upsert => sem texto (provável mídia/ação)", { keys, remoteJid });
+      log(t, "messages.upsert => sem texto (provável mídia/ação)", { keys });
       return;
     }
 
+    const pushName = msg?.pushName ? String(msg.pushName).trim() : null;
+
     log(t, "messages.upsert => texto extraído", {
-      contactKey,
+      phone,
       text: String(text).slice(0, 80),
-      remoteJid,
+      jid: remoteJid,
+      pushName,
     });
 
     const client = await pool.connect();
@@ -474,6 +497,7 @@ async function startSession(tenantId, options = {}) {
     try {
       await client.query("BEGIN");
 
+      // 1) contact (usa pushName quando existir)
       const contactResult = await client.query(
         `
         SELECT id
@@ -482,7 +506,7 @@ async function startSession(tenantId, options = {}) {
           AND phone = $2
         LIMIT 1
         `,
-        [t, contactKey]
+        [t, phone]
       );
 
       let contactId;
@@ -494,13 +518,28 @@ async function startSession(tenantId, options = {}) {
           VALUES ($1, $2, $3)
           RETURNING id
           `,
-          [t, contactKey, contactKey]
+          [t, pushName || phone, phone]
         );
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
+
+        // atualiza nome se veio pushName e ainda não temos nome “bom”
+        if (pushName) {
+          await client.query(
+            `
+            UPDATE contacts
+            SET name = COALESCE(NULLIF(name, ''), $3),
+                updated_at = NOW()
+            WHERE tenant_id = $1
+              AND id = $2
+            `,
+            [t, contactId, pushName]
+          );
+        }
       }
 
+      // 2) conversation
       const convResult = await client.query(
         `
         SELECT id
@@ -535,6 +574,7 @@ async function startSession(tenantId, options = {}) {
         conversationId = convResult.rows[0].id;
       }
 
+      // 3) message
       await client.query(
         `
         INSERT INTO messages (
@@ -548,6 +588,7 @@ async function startSession(tenantId, options = {}) {
         [t, conversationId, String(text)]
       );
 
+      // 4) last_message_at
       await client.query(
         `
         UPDATE conversations
@@ -560,7 +601,7 @@ async function startSession(tenantId, options = {}) {
       );
 
       await client.query("COMMIT");
-      log(t, "messages.upsert => SALVO NO BANCO", { contactKey, remoteJid });
+      log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
     } catch (err) {
       try {
         await client.query("ROLLBACK");
@@ -571,7 +612,6 @@ async function startSession(tenantId, options = {}) {
     }
   });
 
-  // ✅ ALTERAÇÃO NECESSÁRIA: confirma no log que ESTE arquivo foi carregado e o listener foi registrado
   log(t, "messages.upsert listener REGISTRADO (diagnóstico)");
 
   return entry;
