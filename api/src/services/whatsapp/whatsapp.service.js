@@ -510,7 +510,7 @@ async function startSession(tenantId, options = {}) {
       );
 
       let contactId;
-
+ 
       if (contactResult.rowCount === 0) {
         const insert = await client.query(
           `
