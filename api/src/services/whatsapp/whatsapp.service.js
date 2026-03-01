@@ -514,16 +514,27 @@ async function startSession(tenantId, options = {}) {
       if (contactResult.rowCount === 0) {
         const insert = await client.query(
           `
-          INSERT INTO contacts (tenant_id, name, phone)
-          VALUES ($1, $2, $3)
+          INSERT INTO contacts (tenant_id, name, phone, whatsapp_jid)
+          VALUES ($1, $2, $3, $4)
           RETURNING id
           `,
-          [t, pushName || phone, phone]
+          [t, pushName || phone, phone, remoteJid]
         );
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
 
+        // atualiza jid sempre que vier mensagem nova
+        await client.query(
+          `
+          UPDATE contacts
+          SET whatsapp_jid = $3,
+              updated_at = NOW()
+          WHERE tenant_id = $1
+            AND id = $2
+          `,
+          [t, contactId, remoteJid]
+        );
         // atualiza nome se veio pushName e ainda não temos nome “bom”
         if (pushName) {
           await client.query(
