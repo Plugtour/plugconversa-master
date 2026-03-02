@@ -143,9 +143,16 @@ function getSession(tenantId) {
 /**
  * Envia texto real via Baileys
  * phone: somente números (ex: 5511999999999)
+ *
+ * ✅ Ajustado para multi-device:
+ * - tenta usar contacts.whatsapp_jid (pode ser @lid)
+ * - fallback para @s.whatsapp.net
  */
 async function sendText(tenantId, phone, text) {
-  const s = getSession(tenantId);
+  const t = normalizeTenantId(tenantId);
+  if (!t) throw new Error("INVALID_TENANT_ID");
+
+  const s = getSession(t);
 
   if (!s?.sock) {
     throw new Error("WHATSAPP_SESSION_NOT_STARTED");
@@ -156,8 +163,43 @@ async function sendText(tenantId, phone, text) {
     throw new Error("WHATSAPP_NOT_CONNECTED");
   }
 
-  const jid = `${String(phone).replace(/\D/g, "")}@s.whatsapp.net`;
-  await s.sock.sendMessage(jid, { text: String(text) });
+  const cleanPhone = String(phone || "").replace(/\D/g, "");
+  if (!cleanPhone) {
+    throw new Error("PHONE_REQUIRED");
+  }
+
+  // 1) tenta pegar whatsapp_jid do contato (suporta @lid)
+  let jidToSend = null;
+
+  try {
+    const r = await pool.query(
+      `
+      SELECT whatsapp_jid
+      FROM contacts
+      WHERE tenant_id = $1
+        AND phone = $2
+      LIMIT 1
+      `,
+      [t, cleanPhone]
+    );
+
+    const dbJid = r.rows?.[0]?.whatsapp_jid ? String(r.rows[0].whatsapp_jid) : "";
+    if (dbJid && (dbJid.endsWith("@lid") || dbJid.endsWith("@s.whatsapp.net"))) {
+      jidToSend = dbJid;
+    }
+  } catch (e) {
+    // não quebra o envio por causa do DB; cai no fallback
+    logErr(t, "sendText => falha ao consultar whatsapp_jid (fallback ativado):", e?.message || e);
+  }
+
+  // 2) fallback padrão
+  if (!jidToSend) {
+    jidToSend = `${cleanPhone}@s.whatsapp.net`;
+  }
+
+  log(t, "sendText => enviando", { phone: cleanPhone, jid: jidToSend });
+
+  await s.sock.sendMessage(jidToSend, { text: String(text) });
 
   return true;
 }
@@ -535,7 +577,7 @@ async function startSession(tenantId, options = {}) {
           `,
           [t, contactId, remoteJid]
         );
-        
+
         // atualiza nome se veio pushName e ainda não temos nome “bom”
         if (pushName) {
           await client.query(
