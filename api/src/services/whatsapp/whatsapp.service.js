@@ -143,16 +143,9 @@ function getSession(tenantId) {
 /**
  * Envia texto real via Baileys
  * phone: somente números (ex: 5511999999999)
- *
- * ✅ Ajustado para multi-device:
- * - tenta usar contacts.whatsapp_jid (pode ser @lid)
- * - fallback para @s.whatsapp.net
  */
 async function sendText(tenantId, phone, text) {
-  const t = normalizeTenantId(tenantId);
-  if (!t) throw new Error("INVALID_TENANT_ID");
-
-  const s = getSession(t);
+  const s = getSession(tenantId);
 
   if (!s?.sock) {
     throw new Error("WHATSAPP_SESSION_NOT_STARTED");
@@ -163,43 +156,8 @@ async function sendText(tenantId, phone, text) {
     throw new Error("WHATSAPP_NOT_CONNECTED");
   }
 
-  const cleanPhone = String(phone || "").replace(/\D/g, "");
-  if (!cleanPhone) {
-    throw new Error("PHONE_REQUIRED");
-  }
-
-  // 1) tenta pegar whatsapp_jid do contato (suporta @lid)
-  let jidToSend = null;
-
-  try {
-    const r = await pool.query(
-      `
-      SELECT whatsapp_jid
-      FROM contacts
-      WHERE tenant_id = $1
-        AND phone = $2
-      LIMIT 1
-      `,
-      [t, cleanPhone]
-    );
-
-    const dbJid = r.rows?.[0]?.whatsapp_jid ? String(r.rows[0].whatsapp_jid) : "";
-    if (dbJid && (dbJid.endsWith("@lid") || dbJid.endsWith("@s.whatsapp.net"))) {
-      jidToSend = dbJid;
-    }
-  } catch (e) {
-    // não quebra o envio por causa do DB; cai no fallback
-    logErr(t, "sendText => falha ao consultar whatsapp_jid (fallback ativado):", e?.message || e);
-  }
-
-  // 2) fallback padrão
-  if (!jidToSend) {
-    jidToSend = `${cleanPhone}@s.whatsapp.net`;
-  }
-
-  log(t, "sendText => enviando", { phone: cleanPhone, jid: jidToSend });
-
-  await s.sock.sendMessage(jidToSend, { text: String(text) });
+  const jid = `${String(phone).replace(/\D/g, "")}@s.whatsapp.net`;
+  await s.sock.sendMessage(jid, { text: String(text) });
 
   return true;
 }
@@ -461,6 +419,7 @@ async function startSession(tenantId, options = {}) {
   /**
    * ✅ INCOMING (aceita @s.whatsapp.net e @lid)
    * - salva em contacts/conversations/messages
+   * - IMPORTANTe: direction='in' (senão fica 'out' pelo default do banco)
    */
   sock.ev.on("messages.upsert", async (payload) => {
     const { messages, type } = payload || {};
@@ -526,12 +485,14 @@ async function startSession(tenantId, options = {}) {
     }
 
     const pushName = msg?.pushName ? String(msg.pushName).trim() : null;
+    const providerMessageId = msg?.key?.id ? String(msg.key.id) : null;
 
     log(t, "messages.upsert => texto extraído", {
       phone,
       text: String(text).slice(0, 80),
       jid: remoteJid,
       pushName,
+      providerMessageId,
     });
 
     const client = await pool.connect();
@@ -608,18 +569,20 @@ async function startSession(tenantId, options = {}) {
 
       const conversationId = convUpsert.rows[0].id;
 
-      // 3) message
+      // 3) message (direction='in')
       await client.query(
         `
         INSERT INTO messages (
           tenant_id,
           conversation_id,
+          direction,
           sender_type,
+          provider_message_id,
           content
         )
-        VALUES ($1, $2, 'contact', $3)
+        VALUES ($1, $2, 'in', 'contact', $3, $4)
         `,
-        [t, conversationId, String(text)]
+        [t, conversationId, providerMessageId, String(text)]
       );
 
       await client.query("COMMIT");
@@ -646,4 +609,4 @@ module.exports = {
   requestPairingCode,
 };
 
-/* caminho: api/src/services/whatsapp/whatsapp.service.js  */
+/* caminho: api/src/services/whatsapp/whatsapp.service.js */
