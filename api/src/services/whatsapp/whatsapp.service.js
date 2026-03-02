@@ -510,7 +510,7 @@ async function startSession(tenantId, options = {}) {
       );
 
       let contactId;
- 
+
       if (contactResult.rowCount === 0) {
         const insert = await client.query(
           `
@@ -535,6 +535,7 @@ async function startSession(tenantId, options = {}) {
           `,
           [t, contactId, remoteJid]
         );
+        
         // atualiza nome se veio pushName e ainda não temos nome “bom”
         if (pushName) {
           await client.query(
