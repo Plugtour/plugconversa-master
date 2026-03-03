@@ -53,6 +53,10 @@ function withTimeout(promise, ms, label = "operation") {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(t));
 }
 
+function onlyDigits(v) {
+  return String(v || "").replace(/\D/g, "");
+}
+
 /* =========================================================
    QR ROUTES (SEM requireTenant) - permite abrir no navegador
 ========================================================= */
@@ -204,23 +208,17 @@ router.use(requireTenant);
 
 /**
  * ✅ POST /api/whatsapp/resolve-jid
- * Body: { "phone": "55DDDNUMERO", "update_contact": true }
+ * Body: { "phone": "55DDDNUMERO", "update_contact": true|false }
  * - resolve o JID via Baileys (onWhatsApp)
  * - opcionalmente grava em contacts.whatsapp_jid para este phone
- *
- * Observação:
- * - mesmo que chegue @lid em mensagens, aqui buscamos o jid padrão @s.whatsapp.net
- * - o listener de incoming continua podendo sobrescrever whatsapp_jid com @lid quando necessário
  */
 router.post("/resolve-jid", async (req, res, next) => {
-  let client;
-
   try {
     const tenantId = req.tenant_id;
     const { phone, update_contact = false } = req.body || {};
 
-    const p = String(phone || "").trim();
-    if (!p) {
+    const digits = onlyDigits(phone);
+    if (!digits) {
       return res.status(400).json({
         ok: false,
         error: "PHONE_REQUIRED",
@@ -244,18 +242,25 @@ router.post("/resolve-jid", async (req, res, next) => {
       });
     }
 
-    const digits = p.replace(/\D/g, "");
-    const queryJid = `${digits}@s.whatsapp.net`;
+    if (typeof session.sock.onWhatsApp !== "function") {
+      return res.status(500).json({
+        ok: false,
+        error: "ONWHATSAPP_NOT_AVAILABLE",
+        message: "Baileys não expôs onWhatsApp nesta sessão.",
+      });
+    }
+
+    const defaultJid = `${digits}@s.whatsapp.net`;
 
     const list = await withTimeout(
-      session.sock.onWhatsApp(queryJid),
+      session.sock.onWhatsApp(defaultJid),
       WA_SEND_TIMEOUT_MS,
       "onWhatsApp"
     );
 
     const first = Array.isArray(list) ? list[0] : null;
     const exists = !!first?.exists;
-    const resolvedJid = first?.jid ? String(first.jid) : queryJid;
+    const resolvedJid = first?.jid ? String(first.jid) : defaultJid;
 
     if (!exists) {
       return res.status(404).json({
@@ -269,47 +274,55 @@ router.post("/resolve-jid", async (req, res, next) => {
     let updated = false;
 
     if (update_contact) {
-      client = await pool.connect();
-      await client.query("BEGIN");
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
-      const c = await client.query(
-        `
-        SELECT id
-        FROM contacts
-        WHERE tenant_id = $1
-          AND phone = $2
-        LIMIT 1
-        `,
-        [tenantId, digits]
-      );
-
-      const contactId = c.rows[0]?.id || null;
-
-      if (!contactId) {
-        const ins = await client.query(
+        const c = await client.query(
           `
-          INSERT INTO contacts (tenant_id, name, phone, whatsapp_jid)
-          VALUES ($1, NULL, $2, $3)
-          RETURNING id
+          SELECT id
+          FROM contacts
+          WHERE tenant_id = $1
+            AND phone = $2
+          LIMIT 1
           `,
-          [tenantId, digits, resolvedJid]
+          [tenantId, digits]
         );
-        updated = !!ins.rows[0]?.id;
-      } else {
-        const up = await client.query(
-          `
-          UPDATE contacts
-          SET whatsapp_jid = $1,
-              updated_at = NOW()
-          WHERE tenant_id = $2
-            AND id = $3
-          `,
-          [resolvedJid, tenantId, contactId]
-        );
-        updated = up.rowCount > 0;
+
+        const contactId = c.rows[0]?.id || null;
+
+        if (!contactId) {
+          await client.query(
+            `
+            INSERT INTO contacts (tenant_id, name, phone, whatsapp_jid)
+            VALUES ($1, NULL, $2, $3)
+            `,
+            [tenantId, digits, resolvedJid]
+          );
+          updated = true;
+        } else {
+          const up = await client.query(
+            `
+            UPDATE contacts
+            SET whatsapp_jid = $1,
+                updated_at = NOW()
+            WHERE tenant_id = $2
+              AND id = $3
+            `,
+            [resolvedJid, tenantId, contactId]
+          );
+          updated = up.rowCount > 0;
+        }
+
+        await client.query("COMMIT");
+      } catch (e) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+        throw e;
+      } finally {
+        client.release();
       }
-
-      await client.query("COMMIT");
     }
 
     return res.status(200).json({
@@ -322,14 +335,7 @@ router.post("/resolve-jid", async (req, res, next) => {
       },
     });
   } catch (err) {
-    try {
-      if (client) await client.query("ROLLBACK");
-    } catch (e) {}
     return next(err);
-  } finally {
-    try {
-      if (client) client.release();
-    } catch (e) {}
   }
 });
 
@@ -750,13 +756,7 @@ router.post("/send", async (req, res, next) => {
         VALUES ($1, $2, 'out', 'user', $3, $4, $5)
         RETURNING *
         `,
-        [
-          tenantId,
-          conversationId,
-          sender_id,
-          providerMessageId,
-          String(content).trim(),
-        ]
+        [tenantId, conversationId, sender_id, providerMessageId, String(content).trim()]
       );
 
       await client.query(
@@ -903,13 +903,7 @@ router.post("/send", async (req, res, next) => {
       VALUES ($1, $2, 'out', 'user', $3, $4, $5)
       RETURNING *
       `,
-      [
-        tenantId,
-        conversation.id,
-        sender_id,
-        providerMessageId,
-        String(content).trim(),
-      ]
+      [tenantId, conversation.id, sender_id, providerMessageId, String(content).trim()]
     );
 
     await client.query(
