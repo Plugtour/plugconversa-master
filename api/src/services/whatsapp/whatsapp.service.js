@@ -143,15 +143,26 @@ function isPrivateConversationJid(jid) {
 }
 
 /**
- * ✅ Extrai um identificador do contato a partir do JID
- * - "5511999999999@s.whatsapp.net" -> "5511999999999"
- * - "98630031659059@lid" -> "98630031659059"
+ * ✅ Extrai um identificador definitivo do contato a partir do JID
+ * Regras:
+ * - terminar com @lid            -> "lid:<jid>"
+ * - terminar com @s.whatsapp.net -> somente dígitos
+ * - qualquer outro formato       -> "jid:<jid>"
  */
 function extractContactKeyFromJid(jid) {
-  const j = String(jid || "");
-  if (j.endsWith("@s.whatsapp.net")) return j.replace("@s.whatsapp.net", "");
-  if (j.endsWith("@lid")) return j.replace("@lid", "");
-  return "";
+  const j = String(jid || "").trim();
+  if (!j) return "";
+
+  if (j.endsWith("@lid")) {
+    return `lid:${j}`;
+  }
+
+  if (j.endsWith("@s.whatsapp.net")) {
+    const left = j.split("@")[0] || "";
+    return left.replace(/\D/g, "");
+  }
+
+  return `jid:${j}`;
 }
 
 /**
