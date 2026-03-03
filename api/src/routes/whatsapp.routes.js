@@ -7,7 +7,8 @@ const requireTenant = require("../middlewares/requireTenant");
 
 // ✅ Baileys service (real)
 const whatsappService = require("../services/whatsapp/whatsapp.service");
-const { startSession, getSession, sendText, sendTextToJid } = whatsappService;
+const { startSession, getSession, sendText, sendTextToJid, resolveJidByPhone } =
+  whatsappService;
 
 // opcional (só existe se você adicionar no service)
 const requestPairingCode = whatsappService.requestPairingCode;
@@ -207,18 +208,17 @@ router.use(requireTenant);
  * Body: { "phone": "55DDDNUMERO", "update_contact": true }
  * - resolve o JID via Baileys (onWhatsApp)
  * - opcionalmente grava em contacts.whatsapp_jid para este phone
- *
- * Observação:
- * - para contas que chegam como @lid, o melhor JID "real" pode aparecer depois em mensagens recebidas.
- * - esta rota serve principalmente para validar/normalizar e gravar o jid @s.whatsapp.net.
  */
 router.post("/resolve-jid", async (req, res, next) => {
+  const client = await pool.connect();
+
   try {
     const tenantId = req.tenant_id;
     const { phone, update_contact = false } = req.body || {};
 
     const p = String(phone || "").trim();
     if (!p) {
+      client.release();
       return res.status(400).json({
         ok: false,
         error: "PHONE_REQUIRED",
@@ -228,6 +228,7 @@ router.post("/resolve-jid", async (req, res, next) => {
 
     const session = getSession(tenantId);
     if (!session?.sock) {
+      client.release();
       return res.status(400).json({
         ok: false,
         error: "WHATSAPP_SESSION_NOT_STARTED",
@@ -235,6 +236,7 @@ router.post("/resolve-jid", async (req, res, next) => {
     }
 
     if (!session.sock.user?.id) {
+      client.release();
       return res.status(400).json({
         ok: false,
         error: "WHATSAPP_NOT_CONNECTED",
@@ -243,97 +245,96 @@ router.post("/resolve-jid", async (req, res, next) => {
     }
 
     const digits = p.replace(/\D/g, "");
-    const jid = `${digits}@s.whatsapp.net`;
 
-    // onWhatsApp costuma retornar [{ jid, exists }]
-    const list = await withTimeout(
-      session.sock.onWhatsApp(jid),
-      WA_SEND_TIMEOUT_MS,
-      "onWhatsApp"
+    // usa o service (com timeout interno e validações)
+    const r = await withTimeout(
+      resolveJidByPhone(tenantId, digits),
+      Number(process.env.WA_RESOLVE_TIMEOUT_MS || 9000),
+      "resolveJidByPhone"
     );
 
-    const first = Array.isArray(list) ? list[0] : null;
-    const exists = !!first?.exists;
-    const resolvedJid = first?.jid ? String(first.jid) : jid;
-
+    const exists = !!r?.exists;
     if (!exists) {
+      client.release();
       return res.status(404).json({
         ok: false,
         error: "NOT_ON_WHATSAPP",
         message: "Número não encontrado no WhatsApp (onWhatsApp).",
-        data: { phone: digits, jid: resolvedJid, exists: false },
+        data: { phone: digits, exists: false },
       });
+    }
+
+    // melhor JID para salvar/enviar:
+    // - se vier lid, salva como @lid (mais útil para envio quando o contato aparece assim)
+    // - senão, usa o jid resolvido (@s.whatsapp.net)
+    let bestJid = r?.resolved?.jid ? String(r.resolved.jid) : `${digits}@s.whatsapp.net`;
+    if (r?.resolved?.lid) {
+      const lidRaw = String(r.resolved.lid).trim();
+      bestJid = lidRaw.endsWith("@lid") ? lidRaw : `${lidRaw.replace(/@lid$/i, "")}@lid`;
     }
 
     let updated = false;
 
     if (update_contact) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
+      await client.query("BEGIN");
 
-        // garante contact
-        const c = await client.query(
+      // garante contact por phone
+      const c = await client.query(
+        `
+        SELECT id
+        FROM contacts
+        WHERE tenant_id = $1
+          AND phone = $2
+        LIMIT 1
+        `,
+        [tenantId, digits]
+      );
+
+      let contactId = c.rows[0]?.id;
+
+      if (!contactId) {
+        const ins = await client.query(
           `
-          SELECT id
-          FROM contacts
-          WHERE tenant_id = $1
-            AND phone = $2
-          LIMIT 1
+          INSERT INTO contacts (tenant_id, name, phone, whatsapp_jid)
+          VALUES ($1, NULL, $2, $3)
+          RETURNING id
           `,
-          [tenantId, digits]
+          [tenantId, digits, bestJid]
         );
-
-        let contactId = c.rows[0]?.id;
-
-        if (!contactId) {
-          const ins = await client.query(
-            `
-            INSERT INTO contacts (tenant_id, name, phone, whatsapp_jid)
-            VALUES ($1, NULL, $2, $3)
-            RETURNING id
-            `,
-            [tenantId, digits, resolvedJid]
-          );
-          contactId = ins.rows[0].id;
-          updated = true;
-        } else {
-          const up = await client.query(
-            `
-            UPDATE contacts
-            SET whatsapp_jid = $1,
-                updated_at = NOW()
-            WHERE tenant_id = $2
-              AND id = $3
-            `,
-            [resolvedJid, tenantId, contactId]
-          );
-          updated = up.rowCount > 0;
-        }
-
-        await client.query("COMMIT");
-      } catch (e) {
-        try {
-          await pool.query("ROLLBACK");
-        } catch (_) {}
-      } finally {
-        try {
-          // se pool.connect foi usado, ele sempre retorna um client com release
-          // (em caso de falha acima, ele ainda existe)
-        } catch (_) {}
+        contactId = ins.rows[0].id;
+        updated = true;
+      } else {
+        const up = await client.query(
+          `
+          UPDATE contacts
+          SET whatsapp_jid = $1,
+              updated_at = NOW()
+          WHERE tenant_id = $2
+            AND id = $3
+          `,
+          [bestJid, tenantId, contactId]
+        );
+        updated = up.rowCount > 0;
       }
+
+      await client.query("COMMIT");
     }
 
+    client.release();
     return res.status(200).json({
       ok: true,
       data: {
         phone: digits,
-        jid: resolvedJid,
+        jid: bestJid,
         exists: true,
         updated_contact: !!updated,
       },
     });
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (e) {}
+    client.release();
     return next(err);
   }
 });
@@ -485,614 +486,6 @@ router.post("/send-to-jid", async (req, res, next) => {
       ok: true,
       data: msgInsert.rows[0],
       meta: { created_or_used_conversation_id: conversation.id },
-    });
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (e) {}
-    return next(err);
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * GET /api/whatsapp/session
- * Retorna status/qr do banco para o tenant
- */
-router.get("/session", async (req, res, next) => {
-  try {
-    const tenantId = req.tenant_id;
-
-    const r = await pool.query(
-      `
-      SELECT *
-      FROM whatsapp_sessions
-      WHERE tenant_id = $1
-      LIMIT 1
-      `,
-      [tenantId]
-    );
-
-    return res.status(200).json({
-      ok: true,
-      data: r.rows[0] || null,
-    });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-/**
- * ✅ POST /api/whatsapp/session/pair-code
- * Body: { "phone": "55DDDNUMERO" }
- */
-router.post("/session/pair-code", async (req, res, next) => {
-  try {
-    const tenantId = req.tenant_id;
-    const { phone } = req.body || {};
-
-    if (!phone) {
-      return res.status(400).json({
-        ok: false,
-        error: "PHONE_REQUIRED",
-        message: 'Envie {"phone":"55DDDNUMERO"}',
-      });
-    }
-
-    if (typeof requestPairingCode !== "function") {
-      return res.status(500).json({
-        ok: false,
-        error: "PAIR_CODE_NOT_IMPLEMENTED",
-        message:
-          "Seu whatsapp.service.js ainda não exporta requestPairingCode. Vou ajustar no próximo arquivo.",
-      });
-    }
-
-    await startSession(tenantId);
-
-    const code = await requestPairingCode(tenantId, phone);
-
-    return res.status(200).json({
-      ok: true,
-      data: { code },
-      message:
-        "Use este código no celular: WhatsApp > Aparelhos conectados > Conectar com número de telefone.",
-    });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-/**
- * POST /api/whatsapp/session/start
- */
-router.post("/session/start", async (req, res, next) => {
-  const client = await pool.connect();
-
-  try {
-    const tenantId = req.tenant_id;
-
-    await client.query("BEGIN");
-
-    const existing = await client.query(
-      `
-      SELECT id
-      FROM whatsapp_sessions
-      WHERE tenant_id = $1
-      LIMIT 1
-      `,
-      [tenantId]
-    );
-
-    let session;
-
-    if (existing.rowCount === 0) {
-      const insert = await client.query(
-        `
-        INSERT INTO whatsapp_sessions (
-          tenant_id,
-          provider,
-          status,
-          qr_code,
-          connected_at,
-          disconnected_at
-        )
-        VALUES ($1, 'baileys', 'connecting', NULL, NULL, NULL)
-        RETURNING *
-        `,
-        [tenantId]
-      );
-      session = insert.rows[0];
-    } else {
-      const update = await client.query(
-        `
-        UPDATE whatsapp_sessions
-        SET provider = 'baileys',
-            status = 'connecting',
-            qr_code = NULL,
-            updated_at = NOW()
-        WHERE tenant_id = $1
-        RETURNING *
-        `,
-        [tenantId]
-      );
-      session = update.rows[0];
-    }
-
-    await client.query("COMMIT");
-
-    startSession(tenantId).catch((err) => {
-      console.error("[WHATSAPP_START_SESSION_ERROR]", err);
-    });
-
-    return res.status(200).json({
-      ok: true,
-      data: session,
-      message:
-        "Sessão iniciada. Abra /api/whatsapp/session/qr?tenant_id=1 (DEV) ou consulte /api/whatsapp/session (API).",
-    });
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (e) {}
-    return next(err);
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * POST /api/whatsapp/session/disconnect
- */
-router.post("/session/disconnect", async (req, res, next) => {
-  try {
-    const tenantId = req.tenant_id;
-
-    const r = await pool.query(
-      `
-      UPDATE whatsapp_sessions
-      SET status = 'disconnected',
-          disconnected_at = NOW(),
-          updated_at = NOW()
-      WHERE tenant_id = $1
-      RETURNING *
-      `,
-      [tenantId]
-    );
-
-    return res.status(200).json({
-      ok: true,
-      data: r.rows[0] || null,
-    });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-/* =========================================================
-   WEBHOOK INCOMING (manual test)
-========================================================= */
-
-router.post("/webhook/incoming", async (req, res, next) => {
-  const client = await pool.connect();
-
-  try {
-    const tenantId = req.tenant_id;
-    const { phone, message, name = null } = req.body;
-
-    if (!phone || !message) {
-      return res.status(400).json({
-        ok: false,
-        error: "PHONE_AND_MESSAGE_REQUIRED",
-      });
-    }
-
-    await client.query("BEGIN");
-
-    const contactResult = await client.query(
-      `
-      SELECT id, name, phone
-      FROM contacts
-      WHERE tenant_id = $1
-        AND phone = $2
-      LIMIT 1
-      `,
-      [tenantId, phone]
-    );
-
-    let contact = contactResult.rows[0];
-
-    if (!contact) {
-      const contactInsert = await client.query(
-        `
-        INSERT INTO contacts (tenant_id, name, phone)
-        VALUES ($1, $2, $3)
-        RETURNING *
-        `,
-        [tenantId, name, phone]
-      );
-      contact = contactInsert.rows[0];
-    }
-
-    const convResult = await client.query(
-      `
-      SELECT *
-      FROM conversations
-      WHERE tenant_id = $1
-        AND contact_id = $2
-        AND status = 'open'
-      ORDER BY last_message_at DESC NULLS LAST, id DESC
-      LIMIT 1
-      `,
-      [tenantId, contact.id]
-    );
-
-    let conversation = convResult.rows[0];
-
-    if (!conversation) {
-      const convInsert = await client.query(
-        `
-        INSERT INTO conversations (tenant_id, contact_id, status, last_message_at)
-        VALUES ($1, $2, 'open', NOW())
-        RETURNING *
-        `,
-        [tenantId, contact.id]
-      );
-      conversation = convInsert.rows[0];
-    }
-
-    const msgInsert = await client.query(
-      `
-      INSERT INTO messages (tenant_id, conversation_id, sender_type, content)
-      VALUES ($1, $2, 'contact', $3)
-      RETURNING *
-      `,
-      [tenantId, conversation.id, message]
-    );
-
-    await client.query(
-      `
-      UPDATE conversations
-      SET last_message_at = NOW(),
-          updated_at = NOW()
-      WHERE tenant_id = $1
-        AND id = $2
-      `,
-      [tenantId, conversation.id]
-    );
-
-    await client.query("COMMIT");
-
-    return res.status(200).json({
-      ok: true,
-      data: {
-        contact,
-        conversation,
-        message: msgInsert.rows[0],
-      },
-    });
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (e) {}
-    return next(err);
-  } finally {
-    client.release();
-  }
-});
-
-/* =========================================================
-   SEND MESSAGE (REAL via Baileys + grava no banco)
-   ✅ AGORA ACEITA:
-   - por conversation_id  (fluxo normal)
-   - OU por phone         (cria/acha contact + conversation e envia)
-========================================================= */
-
-router.post("/send", async (req, res, next) => {
-  const client = await pool.connect();
-
-  try {
-    const tenantId = req.tenant_id;
-    const { conversation_id, phone, content, sender_id = null } = req.body;
-
-    if (!content || !String(content).trim()) {
-      return res.status(400).json({
-        ok: false,
-        error: "CONTENT_REQUIRED",
-      });
-    }
-
-    const session = getSession(tenantId);
-
-    if (!session?.sock) {
-      return res.status(400).json({
-        ok: false,
-        error: "WHATSAPP_SESSION_NOT_STARTED",
-      });
-    }
-
-    if (!session.sock.user?.id) {
-      return res.status(400).json({
-        ok: false,
-        error: "WHATSAPP_NOT_CONNECTED",
-        message: "Escaneie o QR e aguarde status=connected antes de enviar.",
-      });
-    }
-
-    await client.query("BEGIN");
-
-    // =====================================================
-    // MODO 1: envio por conversation_id (como já era)
-    // =====================================================
-    if (conversation_id) {
-      const conversationId = Number(conversation_id);
-
-      if (!Number.isInteger(conversationId) || conversationId <= 0) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "INVALID_CONVERSATION_ID",
-        });
-      }
-
-      const convResult = await client.query(
-        `
-        SELECT c.id, ct.phone, ct.whatsapp_jid
-        FROM conversations c
-        JOIN contacts ct
-          ON ct.id = c.contact_id
-         AND ct.tenant_id = c.tenant_id
-        WHERE c.tenant_id = $1
-          AND c.id = $2
-        LIMIT 1
-        `,
-        [tenantId, conversationId]
-      );
-
-      if (convResult.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({
-          ok: false,
-          error: "CONVERSATION_NOT_FOUND",
-        });
-      }
-
-      const { phone: ctPhone, whatsapp_jid } = convResult.rows[0];
-
-      let providerMessageId = null;
-      let warning = null;
-
-      try {
-        if (whatsapp_jid && typeof sendTextToJid === "function") {
-          const sent = await withTimeout(
-            sendTextToJid(tenantId, String(whatsapp_jid), String(content).trim()),
-            WA_SEND_TIMEOUT_MS,
-            "sendTextToJid"
-          );
-          providerMessageId = sent?.providerMessageId || null;
-        } else {
-          await withTimeout(
-            sendText(tenantId, ctPhone, String(content).trim()),
-            WA_SEND_TIMEOUT_MS,
-            "sendText"
-          );
-        }
-      } catch (e) {
-        // ✅ Se for timeout, não travamos a API: seguimos e retornamos warning
-        if (e?.code === "WA_SEND_TIMEOUT") {
-          warning = e.message;
-          console.warn("[WA_SEND_TIMEOUT][mode=conversation_id]", {
-            tenantId,
-            conversationId,
-            whatsapp_jid: whatsapp_jid || null,
-            phone: ctPhone,
-            timeout_ms: WA_SEND_TIMEOUT_MS,
-          });
-        } else {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            error: "WHATSAPP_SEND_FAILED",
-            message: e?.message || "Falha ao enviar pelo WhatsApp",
-          });
-        }
-      }
-
-      const msgInsert = await client.query(
-        `
-        INSERT INTO messages (
-          tenant_id,
-          conversation_id,
-          direction,
-          sender_type,
-          sender_id,
-          provider_message_id,
-          content
-        )
-        VALUES ($1, $2, 'out', 'user', $3, $4, $5)
-        RETURNING *
-        `,
-        [
-          tenantId,
-          conversationId,
-          sender_id,
-          providerMessageId,
-          String(content).trim(),
-        ]
-      );
-
-      await client.query(
-        `
-        UPDATE conversations
-        SET last_message_at = NOW(),
-            updated_at = NOW()
-        WHERE tenant_id = $1
-          AND id = $2
-        `,
-        [tenantId, conversationId]
-      );
-
-      await client.query("COMMIT");
-
-      return res.status(200).json({
-        ok: true,
-        data: msgInsert.rows[0],
-        ...(warning ? { warning } : {}),
-      });
-    }
-
-    // =====================================================
-    // MODO 2: envio por phone (novo)
-    // - cria/acha contact (por phone)
-    // - cria/acha conversation (única por contact)
-    // - tenta enviar por whatsapp_jid se existir, senão por phone
-    // =====================================================
-    const p = String(phone || "").trim();
-    if (!p) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        ok: false,
-        error: "PHONE_REQUIRED",
-        message: 'Envie {"phone":"55DDDNUMERO","content":"..."} ou use conversation_id',
-      });
-    }
-
-    // 1) contact
-    let contact = null;
-    const contactResult = await client.query(
-      `
-      SELECT id, name, phone, whatsapp_jid
-      FROM contacts
-      WHERE tenant_id = $1
-        AND phone = $2
-      LIMIT 1
-      `,
-      [tenantId, p]
-    );
-
-    if (contactResult.rowCount > 0) {
-      contact = contactResult.rows[0];
-    } else {
-      const contactInsert = await client.query(
-        `
-        INSERT INTO contacts (tenant_id, name, phone)
-        VALUES ($1, NULL, $2)
-        RETURNING id, name, phone, whatsapp_jid
-        `,
-        [tenantId, p]
-      );
-      contact = contactInsert.rows[0];
-    }
-
-    // 2) conversation (lembrando: tem UNIQUE (tenant_id, contact_id))
-    let conversation = null;
-    const convExisting = await client.query(
-      `
-      SELECT id, tenant_id, contact_id
-      FROM conversations
-      WHERE tenant_id = $1
-        AND contact_id = $2
-      LIMIT 1
-      `,
-      [tenantId, contact.id]
-    );
-
-    if (convExisting.rowCount > 0) {
-      conversation = convExisting.rows[0];
-    } else {
-      const convInsert = await client.query(
-        `
-        INSERT INTO conversations (tenant_id, contact_id, status, last_message_at)
-        VALUES ($1, $2, 'open', NOW())
-        RETURNING id, tenant_id, contact_id
-        `,
-        [tenantId, contact.id]
-      );
-      conversation = convInsert.rows[0];
-    }
-
-    // 3) enviar (com timeout pra rota não travar)
-    let providerMessageId = null;
-    let warning = null;
-
-    try {
-      if (contact.whatsapp_jid && typeof sendTextToJid === "function") {
-        const sent = await withTimeout(
-          sendTextToJid(tenantId, String(contact.whatsapp_jid), String(content).trim()),
-          WA_SEND_TIMEOUT_MS,
-          "sendTextToJid"
-        );
-        providerMessageId = sent?.providerMessageId || null;
-      } else {
-        await withTimeout(
-          sendText(tenantId, p, String(content).trim()),
-          WA_SEND_TIMEOUT_MS,
-          "sendText"
-        );
-      }
-    } catch (e) {
-      if (e?.code === "WA_SEND_TIMEOUT") {
-        warning = e.message;
-        console.warn("[WA_SEND_TIMEOUT][mode=phone]", {
-          tenantId,
-          conversationId: conversation?.id,
-          contactId: contact?.id,
-          whatsapp_jid: contact?.whatsapp_jid || null,
-          phone: p,
-          timeout_ms: WA_SEND_TIMEOUT_MS,
-        });
-      } else {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "WHATSAPP_SEND_FAILED",
-          message: e?.message || "Falha ao enviar pelo WhatsApp",
-        });
-      }
-    }
-
-    const msgInsert = await client.query(
-      `
-      INSERT INTO messages (
-        tenant_id,
-        conversation_id,
-        direction,
-        sender_type,
-        sender_id,
-        provider_message_id,
-        content
-      )
-      VALUES ($1, $2, 'out', 'user', $3, $4, $5)
-      RETURNING *
-      `,
-      [
-        tenantId,
-        conversation.id,
-        sender_id,
-        providerMessageId,
-        String(content).trim(),
-      ]
-    );
-
-    await client.query(
-      `
-      UPDATE conversations
-      SET last_message_at = NOW(),
-          updated_at = NOW()
-      WHERE tenant_id = $1
-        AND id = $2
-      `,
-      [tenantId, conversation.id]
-    );
-
-    await client.query("COMMIT");
-
-    return res.status(200).json({
-      ok: true,
-      data: msgInsert.rows[0],
-      meta: { created_or_used_conversation_id: conversation.id },
-      ...(warning ? { warning } : {}),
     });
   } catch (err) {
     try {
