@@ -56,6 +56,29 @@ function getDisconnectMessage(lastDisconnect) {
 }
 
 /**
+ * ✅ Timeout helper (pra API não ficar travada esperando o Baileys)
+ */
+function withTimeout(promise, ms, label = "operation") {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const err = new Error(`${label}_TIMEOUT_${ms}ms`);
+      err.code = "WA_SEND_TIMEOUT";
+      reject(err);
+    }, ms);
+
+    Promise.resolve(promise)
+      .then((v) => {
+        clearTimeout(timer);
+        resolve(v);
+      })
+      .catch((e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+  });
+}
+
+/**
  * Unwrap: algumas mensagens vêm embrulhadas (ephemeral/viewOnce)
  */
 function unwrapMessageContainer(message) {
@@ -141,8 +164,59 @@ function getSession(tenantId) {
 }
 
 /**
+ * ✅ NOVO: envia para um JID já pronto
+ * - suporta @lid e @s.whatsapp.net
+ * - retorna providerMessageId (quando disponível)
+ */
+async function sendTextToJid(tenantId, jid, text) {
+  const s = getSession(tenantId);
+
+  if (!s?.sock) {
+    throw new Error("WHATSAPP_SESSION_NOT_STARTED");
+  }
+
+  // garante que a sessão realmente conectou
+  if (!s.sock.user?.id) {
+    throw new Error("WHATSAPP_NOT_CONNECTED");
+  }
+
+  let to = String(jid || "").trim();
+
+  // se vier só número, assume s.whatsapp.net
+  if (to && !to.includes("@")) {
+    to = `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+  }
+
+  // valida mínimo
+  if (!isPrivateConversationJid(to)) {
+    throw new Error("INVALID_WHATSAPP_JID");
+  }
+
+  const timeoutMs = Number(process.env.WA_SEND_TIMEOUT_MS || 12000);
+
+  log(tenantId, "sendTextToJid => enviando", {
+    to,
+    preview: String(text).slice(0, 60),
+    timeoutMs,
+  });
+
+  const sent = await withTimeout(
+    s.sock.sendMessage(to, { text: String(text) }),
+    timeoutMs,
+    "SEND_MESSAGE"
+  );
+
+  const providerMessageId = sent?.key?.id ? String(sent.key.id) : null;
+
+  log(tenantId, "sendTextToJid => enviado OK", { to, providerMessageId });
+
+  return { ok: true, providerMessageId, jid: to };
+}
+
+/**
  * Envia texto real via Baileys
  * phone: somente números (ex: 5511999999999)
+ * ✅ agora retorna providerMessageId também
  */
 async function sendText(tenantId, phone, text) {
   const s = getSession(tenantId);
@@ -157,9 +231,25 @@ async function sendText(tenantId, phone, text) {
   }
 
   const jid = `${String(phone).replace(/\D/g, "")}@s.whatsapp.net`;
-  await s.sock.sendMessage(jid, { text: String(text) });
+  const timeoutMs = Number(process.env.WA_SEND_TIMEOUT_MS || 12000);
 
-  return true;
+  log(tenantId, "sendText => enviando", {
+    jid,
+    preview: String(text).slice(0, 60),
+    timeoutMs,
+  });
+
+  const sent = await withTimeout(
+    s.sock.sendMessage(jid, { text: String(text) }),
+    timeoutMs,
+    "SEND_MESSAGE"
+  );
+
+  const providerMessageId = sent?.key?.id ? String(sent.key.id) : null;
+
+  log(tenantId, "sendText => enviado OK", { jid, providerMessageId });
+
+  return { ok: true, providerMessageId, jid };
 }
 
 /**
@@ -606,7 +696,8 @@ module.exports = {
   startSession,
   getSession,
   sendText,
+  sendTextToJid,
   requestPairingCode,
 };
 
-/* caminho: api/src/services/whatsapp/whatsapp.service.js */ 
+/* caminho: api/src/services/whatsapp/whatsapp.service.js */

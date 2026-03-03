@@ -1,0 +1,38 @@
+/* caminho: front-app/src/theme/globals.css */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--pc-font-family);
+  background: var(--pc-bg-primary);
+  color: var(--pc-text-primary);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-weight: 600;
+}
+
+button {
+  font-family: var(--pc-font-family);
+  border-radius: var(--pc-radius-md);
+  border: 1px solid var(--pc-border);
+  background: var(--pc-surface);
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: var(--pc-transition);
+}
+
+button:hover {
+  opacity: 0.85;
+}
+
+/* caminho: front-app/src/theme/globals.css */

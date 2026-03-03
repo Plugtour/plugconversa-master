@@ -5,6 +5,10 @@ const router = express.Router();
 const { pool } = require("../db");
 const requireTenant = require("../middlewares/requireTenant");
 
+// ✅ Baileys service
+const whatsappService = require("../services/whatsapp/whatsapp.service");
+const { getSession, sendText, sendTextToJid } = whatsappService;
+
 // Todas as rotas do inbox exigem tenant
 router.use(requireTenant);
 
@@ -88,8 +92,12 @@ router.get("/conversations/:id/messages", async (req, res, next) => {
 
 /**
  * POST /api/inbox/conversations/:id/messages
+ * ✅ envia WhatsApp real + salva no banco
+ * ✅ AJUSTE: prioriza whatsapp_jid (ex: ...@lid)
  */
 router.post("/conversations/:id/messages", async (req, res, next) => {
+  const client = await pool.connect();
+
   try {
     const tenantId = req.tenant_id;
     const conversationId = Number(req.params.id);
@@ -109,28 +117,95 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       });
     }
 
+    // ✅ valida sessão em memória
+    const session = getSession(tenantId);
+    if (!session?.sock) {
+      return res.status(400).json({
+        ok: false,
+        error: "WHATSAPP_SESSION_NOT_STARTED",
+      });
+    }
+    if (!session.sock.user?.id) {
+      return res.status(400).json({
+        ok: false,
+        error: "WHATSAPP_NOT_CONNECTED",
+        message: "Aguarde status=connected antes de enviar.",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // ✅ pega destino (whatsapp_jid e phone)
+    const convResult = await client.query(
+      `
+      SELECT c.id, ct.phone, ct.whatsapp_jid
+      FROM conversations c
+      JOIN contacts ct
+        ON ct.id = c.contact_id
+       AND ct.tenant_id = c.tenant_id
+      WHERE c.tenant_id = $1
+        AND c.id = $2
+      LIMIT 1
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (convResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    const { phone, whatsapp_jid } = convResult.rows[0];
+
+    let providerMessageId = null;
+
+    try {
+      if (whatsapp_jid && typeof sendTextToJid === "function") {
+        const sent = await sendTextToJid(
+          tenantId,
+          String(whatsapp_jid),
+          String(content).trim()
+        );
+        providerMessageId = sent?.providerMessageId || null;
+      } else {
+        await sendText(tenantId, phone, String(content).trim());
+      }
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        error: "WHATSAPP_SEND_FAILED",
+        message: e?.message || "Falha ao enviar pelo WhatsApp",
+      });
+    }
+
     const insertQuery = `
       INSERT INTO messages (
         tenant_id,
         conversation_id,
+        direction,
         sender_type,
         sender_id,
+        provider_message_id,
         content
       )
-      VALUES ($1, $2, $3, $4, $5)
+      VALUES ($1, $2, 'out', $3, $4, $5, $6)
       RETURNING *
     `;
 
-    const r = await pool.query(insertQuery, [
+    const r = await client.query(insertQuery, [
       tenantId,
       conversationId,
       sender_type,
       sender_id,
+      providerMessageId,
       String(content).trim(),
     ]);
 
-    // Atualiza last_message_at da conversation (só dentro do tenant)
-    await pool.query(
+    await client.query(
       `
       UPDATE conversations
       SET last_message_at = NOW(),
@@ -141,22 +216,25 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       [tenantId, conversationId]
     );
 
+    await client.query("COMMIT");
+
     return res.status(201).json({
       ok: true,
       data: r.rows[0],
     });
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (e) {}
     return next(err);
+  } finally {
+    client.release();
   }
 });
 
 /**
  * POST /api/inbox/contacts/:contact_id/messages
- * Envia mensagem para um contact.
- * - Se não existir conversation "open" para esse contact no tenant: cria
- * - Insere mensagem
- * - Atualiza last_message_at
- * - Retorna conversation + message
+ * (mantido como estava)
  */
 router.post("/contacts/:contact_id/messages", async (req, res, next) => {
   const client = await pool.connect();
@@ -164,7 +242,12 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
   try {
     const tenantId = req.tenant_id;
     const contactId = Number(req.params.contact_id);
-    const { content, sender_type = "user", sender_id = null, assigned_user_id = null } = req.body;
+    const {
+      content,
+      sender_type = "user",
+      sender_id = null,
+      assigned_user_id = null,
+    } = req.body;
 
     if (!Number.isInteger(contactId) || contactId <= 0) {
       return res.status(400).json({

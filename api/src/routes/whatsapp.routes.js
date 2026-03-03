@@ -29,6 +29,30 @@ function getTenantIdFromRequest(req) {
   return null;
 }
 
+/**
+ * ✅ Helper: evita travar a API no envio (Baileys às vezes fica aguardando ACK)
+ */
+const WA_SEND_TIMEOUT_MS = Number(process.env.WA_SEND_TIMEOUT_MS || 8000);
+
+class WATimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "WATimeoutError";
+    this.code = "WA_SEND_TIMEOUT";
+  }
+}
+
+function withTimeout(promise, ms, label = "operation") {
+  let t;
+  const timeoutPromise = new Promise((_, reject) => {
+    t = setTimeout(() => {
+      reject(new WATimeoutError(`Timeout (${ms}ms) em ${label}`));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(t));
+}
+
 /* =========================================================
    QR ROUTES (SEM requireTenant) - permite abrir no navegador
 ========================================================= */
@@ -543,25 +567,42 @@ router.post("/send", async (req, res, next) => {
       const { phone: ctPhone, whatsapp_jid } = convResult.rows[0];
 
       let providerMessageId = null;
+      let warning = null;
 
       try {
         if (whatsapp_jid && typeof sendTextToJid === "function") {
-          const sent = await sendTextToJid(
-            tenantId,
-            String(whatsapp_jid),
-            String(content).trim()
+          const sent = await withTimeout(
+            sendTextToJid(tenantId, String(whatsapp_jid), String(content).trim()),
+            WA_SEND_TIMEOUT_MS,
+            "sendTextToJid"
           );
           providerMessageId = sent?.providerMessageId || null;
         } else {
-          await sendText(tenantId, ctPhone, String(content).trim());
+          await withTimeout(
+            sendText(tenantId, ctPhone, String(content).trim()),
+            WA_SEND_TIMEOUT_MS,
+            "sendText"
+          );
         }
       } catch (e) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "WHATSAPP_SEND_FAILED",
-          message: e?.message || "Falha ao enviar pelo WhatsApp",
-        });
+        // ✅ Se for timeout, não travamos a API: seguimos e retornamos warning
+        if (e?.code === "WA_SEND_TIMEOUT") {
+          warning = e.message;
+          console.warn("[WA_SEND_TIMEOUT][mode=conversation_id]", {
+            tenantId,
+            conversationId,
+            whatsapp_jid: whatsapp_jid || null,
+            phone: ctPhone,
+            timeout_ms: WA_SEND_TIMEOUT_MS,
+          });
+        } else {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            error: "WHATSAPP_SEND_FAILED",
+            message: e?.message || "Falha ao enviar pelo WhatsApp",
+          });
+        }
       }
 
       const msgInsert = await client.query(
@@ -603,6 +644,7 @@ router.post("/send", async (req, res, next) => {
       return res.status(200).json({
         ok: true,
         data: msgInsert.rows[0],
+        ...(warning ? { warning } : {}),
       });
     }
 
@@ -676,26 +718,44 @@ router.post("/send", async (req, res, next) => {
       conversation = convInsert.rows[0];
     }
 
-    // 3) enviar
+    // 3) enviar (com timeout pra rota não travar)
     let providerMessageId = null;
+    let warning = null;
+
     try {
       if (contact.whatsapp_jid && typeof sendTextToJid === "function") {
-        const sent = await sendTextToJid(
-          tenantId,
-          String(contact.whatsapp_jid),
-          String(content).trim()
+        const sent = await withTimeout(
+          sendTextToJid(tenantId, String(contact.whatsapp_jid), String(content).trim()),
+          WA_SEND_TIMEOUT_MS,
+          "sendTextToJid"
         );
         providerMessageId = sent?.providerMessageId || null;
       } else {
-        await sendText(tenantId, p, String(content).trim());
+        await withTimeout(
+          sendText(tenantId, p, String(content).trim()),
+          WA_SEND_TIMEOUT_MS,
+          "sendText"
+        );
       }
     } catch (e) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        ok: false,
-        error: "WHATSAPP_SEND_FAILED",
-        message: e?.message || "Falha ao enviar pelo WhatsApp",
-      });
+      if (e?.code === "WA_SEND_TIMEOUT") {
+        warning = e.message;
+        console.warn("[WA_SEND_TIMEOUT][mode=phone]", {
+          tenantId,
+          conversationId: conversation?.id,
+          contactId: contact?.id,
+          whatsapp_jid: contact?.whatsapp_jid || null,
+          phone: p,
+          timeout_ms: WA_SEND_TIMEOUT_MS,
+        });
+      } else {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "WHATSAPP_SEND_FAILED",
+          message: e?.message || "Falha ao enviar pelo WhatsApp",
+        });
+      }
     }
 
     const msgInsert = await client.query(
@@ -738,6 +798,7 @@ router.post("/send", async (req, res, next) => {
       ok: true,
       data: msgInsert.rows[0],
       meta: { created_or_used_conversation_id: conversation.id },
+      ...(warning ? { warning } : {}),
     });
   } catch (err) {
     try {

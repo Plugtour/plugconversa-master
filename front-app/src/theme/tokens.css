@@ -1,0 +1,24 @@
+/* caminho: front-app/src/theme/tokens.css */
+
+:root {
+  --pc-font-family: "Inter", system-ui, -apple-system, sans-serif;
+
+  --pc-text-primary: #1e293b;
+  --pc-text-secondary: #64748b;
+
+  --pc-bg-primary: #f8fafc;
+  --pc-surface: #ffffff;
+
+  --pc-border: #e2e8f0;
+
+  --pc-radius-sm: 6px;
+  --pc-radius-md: 10px;
+  --pc-radius-lg: 14px;
+
+  --pc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --pc-shadow-md: 0 4px 10px rgba(0, 0, 0, 0.08);
+
+  --pc-transition: 0.2s ease;
+}
+
+/* caminho: front-app/src/theme/tokens.css */

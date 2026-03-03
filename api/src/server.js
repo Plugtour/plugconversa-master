@@ -4,16 +4,18 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { ping } = require("./db");
+const { ping, pool } = require("./db");
 const inboxRoutes = require("./routes/inbox.routes");
 const whatsappRoutes = require("./routes/whatsapp.routes");
+
+// ✅ IMPORTANTE: importar startSession
+const { startSession } = require("./services/whatsapp/whatsapp.service");
 
 const app = express();
 
 // ===== Config =====
 const PORT = Number(process.env.PORT || 3000);
 
-// Se quiser travar CORS depois, vamos ajustar via .env (por enquanto libera)
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
@@ -45,7 +47,6 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// Endpoint dedicado pra validar DB
 app.get("/api/db/ping", async (req, res) => {
   try {
     const ok = await ping();
@@ -63,7 +64,7 @@ app.get("/api/db/ping", async (req, res) => {
 // ===== Inbox =====
 app.use("/api/inbox", inboxRoutes);
 
-// ===== WhatsApp (webhook simulado) =====
+// ===== WhatsApp =====
 app.use("/api/whatsapp", whatsappRoutes);
 
 // ===== 404 =====
@@ -85,8 +86,41 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ===== AUTO RESTORE WHATSAPP =====
+async function restoreWhatsAppSessions() {
+  try {
+    console.log("[WA][BOOT] Verificando sessões conectadas no banco...");
+
+    const result = await pool.query(
+      `SELECT tenant_id FROM whatsapp_sessions WHERE status = 'connected'`
+    );
+
+    if (result.rowCount === 0) {
+      console.log("[WA][BOOT] Nenhuma sessão para restaurar.");
+      return;
+    }
+
+    for (const row of result.rows) {
+      const tenantId = row.tenant_id;
+      console.log(`[WA][BOOT] Restaurando sessão tenant ${tenantId}...`);
+
+      try {
+        await startSession(tenantId);
+      } catch (err) {
+        console.error(
+          `[WA][BOOT] Falha ao restaurar tenant ${tenantId}:`,
+          err?.message || err
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[WA][BOOT_ERROR]", err?.message || err);
+  }
+}
+
 // ===== Start =====
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[API] Rodando em http://localhost:${PORT}`);
+  await restoreWhatsAppSessions();
 });
 /* caminho: api/src/server.js */

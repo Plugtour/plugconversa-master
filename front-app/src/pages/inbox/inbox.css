@@ -1,0 +1,77 @@
+/* caminho: front-app/src/pages/inbox/inbox.css */
+
+.pcPage {
+  padding: 24px;
+}
+
+.pcPageHeader {
+  margin-bottom: 18px;
+}
+
+.pcPageTitle {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.pcPageSubtitle {
+  margin: 6px 0 0;
+  color: var(--pc-text-secondary);
+  font-size: 14px;
+}
+
+.pcPageBody {
+  margin-top: 18px;
+}
+
+.pcInboxGrid {
+  display: grid;
+  grid-template-columns: 320px 1fr 360px;
+  gap: 14px;
+  min-height: calc(100vh - 140px);
+}
+
+.pcBlock {
+  min-height: 300px;
+}
+
+.pcCard {
+  background: var(--pc-surface);
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius-lg);
+  box-shadow: var(--pc-shadow-sm);
+  padding: 14px;
+  height: 100%;
+}
+
+/* responsivo */
+@media (max-width: 1100px) {
+  .pcInboxGrid {
+    grid-template-columns: 300px 1fr;
+    grid-template-areas:
+      "b1 b2"
+      "b3 b3";
+  }
+
+  .pcInboxBlock1 {
+    grid-area: b1;
+  }
+  .pcInboxBlock2 {
+    grid-area: b2;
+  }
+  .pcInboxBlock3 {
+    grid-area: b3;
+  }
+}
+
+@media (max-width: 820px) {
+  .pcInboxGrid {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "b1"
+      "b2"
+      "b3";
+  }
+}
+
+/* caminho: front-app/src/pages/inbox/inbox.css */
