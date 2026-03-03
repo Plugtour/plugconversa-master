@@ -164,6 +164,60 @@ function getSession(tenantId) {
 }
 
 /**
+ * ✅ Resolve JID a partir de phone (somente números)
+ * - consulta o WhatsApp via Baileys (sock.onWhatsApp)
+ * - retorna info suficiente para normalização (@lid vs @s.whatsapp.net)
+ */
+async function resolveJidByPhone(tenantId, phone) {
+  const t = normalizeTenantId(tenantId);
+  if (!t) throw new Error("INVALID_TENANT_ID");
+
+  const s = getSession(t);
+  if (!s?.sock) throw new Error("WHATSAPP_SESSION_NOT_STARTED");
+
+  // garante que a sessão realmente conectou
+  if (!s.sock.user?.id) throw new Error("WHATSAPP_NOT_CONNECTED");
+
+  const cleanPhone = String(phone || "").replace(/\D/g, "");
+  if (!cleanPhone) throw new Error("PHONE_REQUIRED");
+
+  // onWhatsApp espera um jid @s.whatsapp.net
+  const jid = `${cleanPhone}@s.whatsapp.net`;
+
+  if (typeof s.sock.onWhatsApp !== "function") {
+    throw new Error("ONWHATSAPP_NOT_SUPPORTED_BY_BAILEYS");
+  }
+
+  const timeoutMs = Number(process.env.WA_RESOLVE_TIMEOUT_MS || 8000);
+
+  log(t, "resolveJidByPhone => consultando onWhatsApp", { jid, timeoutMs });
+
+  const result = await withTimeout(s.sock.onWhatsApp(jid), timeoutMs, "ON_WHATSAPP");
+
+  // formatos comuns do Baileys: array com { jid, exists, ... } e às vezes lid
+  const row = Array.isArray(result) ? result[0] : result;
+
+  const exists = !!row?.exists;
+  const resolvedJid = row?.jid ? String(row.jid) : jid;
+
+  // algumas versões trazem lid separado
+  const lid = row?.lid ? String(row.lid) : null;
+
+  log(t, "resolveJidByPhone => resultado", { exists, resolvedJid, lid });
+
+  return {
+    ok: true,
+    exists,
+    input: { phone: cleanPhone, jid },
+    resolved: {
+      jid: resolvedJid,
+      lid,
+    },
+    raw: row || null,
+  };
+}
+
+/**
  * ✅ NOVO: envia para um JID já pronto
  * - suporta @lid e @s.whatsapp.net
  * - retorna providerMessageId (quando disponível)
@@ -698,6 +752,7 @@ module.exports = {
   sendText,
   sendTextToJid,
   requestPairingCode,
+  resolveJidByPhone,
 };
 
 /* caminho: api/src/services/whatsapp/whatsapp.service.js */
