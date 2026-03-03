@@ -203,7 +203,11 @@ async function resolveJidByPhone(tenantId, phone) {
 
   log(t, "resolveJidByPhone => consultando onWhatsApp", { jid, timeoutMs });
 
-  const result = await withTimeout(s.sock.onWhatsApp(jid), timeoutMs, "ON_WHATSAPP");
+  const result = await withTimeout(
+    s.sock.onWhatsApp(jid),
+    timeoutMs,
+    "ON_WHATSAPP"
+  );
 
   // formatos comuns do Baileys: array com { jid, exists, ... } e às vezes lid
   const row = Array.isArray(result) ? result[0] : result;
@@ -655,17 +659,65 @@ async function startSession(tenantId, options = {}) {
     try {
       await client.query("BEGIN");
 
-      // 1) contact (usa pushName quando existir)
-      const contactResult = await client.query(
-        `
-        SELECT id
-        FROM contacts
-        WHERE tenant_id = $1
-          AND phone = $2
-        LIMIT 1
-        `,
-        [t, phone]
-      );
+      const isLid = String(remoteJid || "").endsWith("@lid");
+      const legacyLidPhone = isLid ? String(remoteJid).replace("@lid", "") : null;
+
+      // 1) contact (blindado contra duplicação lid vs legado)
+      let contactResult;
+
+      if (isLid) {
+        // 1) por whatsapp_jid (mais forte)
+        contactResult = await client.query(
+          `
+          SELECT id, phone
+          FROM contacts
+          WHERE tenant_id = $1
+            AND whatsapp_jid = $2
+          LIMIT 1
+          `,
+          [t, remoteJid]
+        );
+
+        // 2) por phone novo (lid:<jid>)
+        if (contactResult.rowCount === 0) {
+          contactResult = await client.query(
+            `
+            SELECT id, phone
+            FROM contacts
+            WHERE tenant_id = $1
+              AND phone = $2
+            LIMIT 1
+            `,
+            [t, phone]
+          );
+        }
+
+        // 3) por phone legado (sem prefixo)
+        if (contactResult.rowCount === 0 && legacyLidPhone) {
+          contactResult = await client.query(
+            `
+            SELECT id, phone
+            FROM contacts
+            WHERE tenant_id = $1
+              AND phone = $2
+            LIMIT 1
+            `,
+            [t, legacyLidPhone]
+          );
+        }
+      } else {
+        // não-lid: mantém regra atual (phone numérico)
+        contactResult = await client.query(
+          `
+          SELECT id, phone
+          FROM contacts
+          WHERE tenant_id = $1
+            AND phone = $2
+          LIMIT 1
+          `,
+          [t, phone]
+        );
+      }
 
       let contactId;
 
@@ -681,6 +733,7 @@ async function startSession(tenantId, options = {}) {
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
+        const existingPhone = contactResult.rows[0].phone ? String(contactResult.rows[0].phone) : "";
 
         // atualiza jid sempre que vier mensagem nova
         await client.query(
@@ -693,6 +746,27 @@ async function startSession(tenantId, options = {}) {
           `,
           [t, contactId, remoteJid]
         );
+
+        // migra phone legado -> phone novo lid:<jid>
+        if (isLid && existingPhone && existingPhone !== phone) {
+          // só migra se era o legado (digits) ou algo que não seja lid:/jid:
+          const canMigrate =
+            existingPhone === legacyLidPhone ||
+            (!existingPhone.startsWith("lid:") && !existingPhone.startsWith("jid:"));
+
+          if (canMigrate) {
+            await client.query(
+              `
+              UPDATE contacts
+              SET phone = $3,
+                  updated_at = NOW()
+              WHERE tenant_id = $1
+                AND id = $2
+              `,
+              [t, contactId, phone]
+            );
+          }
+        }
 
         // atualiza nome se veio pushName e ainda não temos nome “bom”
         if (pushName) {
