@@ -7,7 +7,7 @@ const requireTenant = require("../middlewares/requireTenant");
 
 // ✅ Baileys service (real)
 const whatsappService = require("../services/whatsapp/whatsapp.service");
-const { startSession, getSession, sendText } = whatsappService;
+const { startSession, getSession, sendText, sendTextToJid } = whatsappService;
 
 // opcional (só existe se você adicionar no service)
 const requestPairingCode = whatsappService.requestPairingCode;
@@ -466,6 +466,9 @@ router.post("/webhook/incoming", async (req, res, next) => {
 
 /* =========================================================
    SEND MESSAGE (REAL via Baileys + grava no banco)
+   ✅ AGORA ACEITA:
+   - por conversation_id  (fluxo normal)
+   - OU por phone         (cria/acha contact + conversation e envia)
 ========================================================= */
 
 router.post("/send", async (req, res, next) => {
@@ -473,16 +476,7 @@ router.post("/send", async (req, res, next) => {
 
   try {
     const tenantId = req.tenant_id;
-    const { conversation_id, content, sender_id = null } = req.body;
-
-    const conversationId = Number(conversation_id);
-
-    if (!Number.isInteger(conversationId) || conversationId <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "INVALID_CONVERSATION_ID",
-      });
-    }
+    const { conversation_id, phone, content, sender_id = null } = req.body;
 
     if (!content || !String(content).trim()) {
       return res.status(400).json({
@@ -510,32 +504,191 @@ router.post("/send", async (req, res, next) => {
 
     await client.query("BEGIN");
 
-    const convResult = await client.query(
-      `
-      SELECT c.id, ct.phone
-      FROM conversations c
-      JOIN contacts ct
-        ON ct.id = c.contact_id
-       AND ct.tenant_id = c.tenant_id
-      WHERE c.tenant_id = $1
-        AND c.id = $2
-      LIMIT 1
-      `,
-      [tenantId, conversationId]
-    );
+    // =====================================================
+    // MODO 1: envio por conversation_id (como já era)
+    // =====================================================
+    if (conversation_id) {
+      const conversationId = Number(conversation_id);
 
-    if (convResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        ok: false,
-        error: "CONVERSATION_NOT_FOUND",
+      if (!Number.isInteger(conversationId) || conversationId <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_CONVERSATION_ID",
+        });
+      }
+
+      const convResult = await client.query(
+        `
+        SELECT c.id, ct.phone, ct.whatsapp_jid
+        FROM conversations c
+        JOIN contacts ct
+          ON ct.id = c.contact_id
+         AND ct.tenant_id = c.tenant_id
+        WHERE c.tenant_id = $1
+          AND c.id = $2
+        LIMIT 1
+        `,
+        [tenantId, conversationId]
+      );
+
+      if (convResult.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          ok: false,
+          error: "CONVERSATION_NOT_FOUND",
+        });
+      }
+
+      const { phone: ctPhone, whatsapp_jid } = convResult.rows[0];
+
+      let providerMessageId = null;
+
+      try {
+        if (whatsapp_jid && typeof sendTextToJid === "function") {
+          const sent = await sendTextToJid(
+            tenantId,
+            String(whatsapp_jid),
+            String(content).trim()
+          );
+          providerMessageId = sent?.providerMessageId || null;
+        } else {
+          await sendText(tenantId, ctPhone, String(content).trim());
+        }
+      } catch (e) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "WHATSAPP_SEND_FAILED",
+          message: e?.message || "Falha ao enviar pelo WhatsApp",
+        });
+      }
+
+      const msgInsert = await client.query(
+        `
+        INSERT INTO messages (
+          tenant_id,
+          conversation_id,
+          direction,
+          sender_type,
+          sender_id,
+          provider_message_id,
+          content
+        )
+        VALUES ($1, $2, 'out', 'user', $3, $4, $5)
+        RETURNING *
+        `,
+        [
+          tenantId,
+          conversationId,
+          sender_id,
+          providerMessageId,
+          String(content).trim(),
+        ]
+      );
+
+      await client.query(
+        `
+        UPDATE conversations
+        SET last_message_at = NOW(),
+            updated_at = NOW()
+        WHERE tenant_id = $1
+          AND id = $2
+        `,
+        [tenantId, conversationId]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        ok: true,
+        data: msgInsert.rows[0],
       });
     }
 
-    const { phone } = convResult.rows[0];
+    // =====================================================
+    // MODO 2: envio por phone (novo)
+    // - cria/acha contact (por phone)
+    // - cria/acha conversation (única por contact)
+    // - tenta enviar por whatsapp_jid se existir, senão por phone
+    // =====================================================
+    const p = String(phone || "").trim();
+    if (!p) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        error: "PHONE_REQUIRED",
+        message: 'Envie {"phone":"55DDDNUMERO","content":"..."} ou use conversation_id',
+      });
+    }
 
+    // 1) contact
+    let contact = null;
+    const contactResult = await client.query(
+      `
+      SELECT id, name, phone, whatsapp_jid
+      FROM contacts
+      WHERE tenant_id = $1
+        AND phone = $2
+      LIMIT 1
+      `,
+      [tenantId, p]
+    );
+
+    if (contactResult.rowCount > 0) {
+      contact = contactResult.rows[0];
+    } else {
+      const contactInsert = await client.query(
+        `
+        INSERT INTO contacts (tenant_id, name, phone)
+        VALUES ($1, NULL, $2)
+        RETURNING id, name, phone, whatsapp_jid
+        `,
+        [tenantId, p]
+      );
+      contact = contactInsert.rows[0];
+    }
+
+    // 2) conversation (lembrando: tem UNIQUE (tenant_id, contact_id))
+    let conversation = null;
+    const convExisting = await client.query(
+      `
+      SELECT id, tenant_id, contact_id
+      FROM conversations
+      WHERE tenant_id = $1
+        AND contact_id = $2
+      LIMIT 1
+      `,
+      [tenantId, contact.id]
+    );
+
+    if (convExisting.rowCount > 0) {
+      conversation = convExisting.rows[0];
+    } else {
+      const convInsert = await client.query(
+        `
+        INSERT INTO conversations (tenant_id, contact_id, status, last_message_at)
+        VALUES ($1, $2, 'open', NOW())
+        RETURNING id, tenant_id, contact_id
+        `,
+        [tenantId, contact.id]
+      );
+      conversation = convInsert.rows[0];
+    }
+
+    // 3) enviar
+    let providerMessageId = null;
     try {
-      await sendText(tenantId, phone, String(content).trim());
+      if (contact.whatsapp_jid && typeof sendTextToJid === "function") {
+        const sent = await sendTextToJid(
+          tenantId,
+          String(contact.whatsapp_jid),
+          String(content).trim()
+        );
+        providerMessageId = sent?.providerMessageId || null;
+      } else {
+        await sendText(tenantId, p, String(content).trim());
+      }
     } catch (e) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -550,14 +703,22 @@ router.post("/send", async (req, res, next) => {
       INSERT INTO messages (
         tenant_id,
         conversation_id,
+        direction,
         sender_type,
         sender_id,
+        provider_message_id,
         content
       )
-      VALUES ($1, $2, 'user', $3, $4)
+      VALUES ($1, $2, 'out', 'user', $3, $4, $5)
       RETURNING *
       `,
-      [tenantId, conversationId, sender_id, String(content).trim()]
+      [
+        tenantId,
+        conversation.id,
+        sender_id,
+        providerMessageId,
+        String(content).trim(),
+      ]
     );
 
     await client.query(
@@ -568,7 +729,7 @@ router.post("/send", async (req, res, next) => {
       WHERE tenant_id = $1
         AND id = $2
       `,
-      [tenantId, conversationId]
+      [tenantId, conversation.id]
     );
 
     await client.query("COMMIT");
@@ -576,6 +737,7 @@ router.post("/send", async (req, res, next) => {
     return res.status(200).json({
       ok: true,
       data: msgInsert.rows[0],
+      meta: { created_or_used_conversation_id: conversation.id },
     });
   } catch (err) {
     try {
