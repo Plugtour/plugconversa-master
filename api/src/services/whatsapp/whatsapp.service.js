@@ -17,6 +17,28 @@ const { pool } = require("../../db");
 // sessões em memória por tenant
 const sessions = new Map();
 
+// ✅ garante registry global do SSE (mesmo usado no inbox.routes.js)
+if (!global.__plugconversa_sse_clients) {
+  global.__plugconversa_sse_clients = new Map(); // tenantId => Set(res)
+}
+
+// ✅ helper mínimo p/ emitir SSE sem depender do inbox.routes.js
+function sseEmitToTenant(tenantId, eventName, payload) {
+  try {
+    const map = global.__plugconversa_sse_clients;
+    const set = map?.get(tenantId);
+    if (!set || set.size === 0) return;
+
+    const data = JSON.stringify(payload ?? {});
+    for (const res of set) {
+      try {
+        res.write(`event: ${eventName}\n`);
+        res.write(`data: ${data}\n\n`);
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
 function normalizeTenantId(tenantId) {
   const n = Number(tenantId);
   if (!Number.isInteger(n) || n <= 0) return null;
@@ -770,7 +792,9 @@ async function startSession(tenantId, options = {}) {
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
-        const existingPhone = contactResult.rows[0].phone ? String(contactResult.rows[0].phone) : "";
+        const existingPhone = contactResult.rows[0].phone
+          ? String(contactResult.rows[0].phone)
+          : "";
 
         // atualiza jid sempre que vier mensagem nova
         await client.query(
@@ -859,24 +883,11 @@ async function startSession(tenantId, options = {}) {
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
 
       // ✅ SSE (mensagem recebida)
-      try {
-        // mesmo registry global usado no inbox.routes.js
-        const map = global.__plugconversa_sse_clients;
-        const set = map?.get(t);
-        if (set && set.size > 0) {
-          const payload = JSON.stringify({
-            tenant_id: t,
-            conversation_id: outConversationId,
-            message: outInsertedMessage,
-          });
-          for (const res of set) {
-            try {
-              res.write(`event: message\n`);
-              res.write(`data: ${payload}\n\n`);
-            } catch (e) {}
-          }
-        }
-      } catch (e) {}
+      sseEmitToTenant(t, "message", {
+        tenant_id: t,
+        conversation_id: outConversationId,
+        message: outInsertedMessage,
+      });
     } catch (err) {
       try {
         await client.query("ROLLBACK");
@@ -901,4 +912,4 @@ module.exports = {
   resolveJidByPhone,
 };
 
-/* caminho: api/src/services/whatsapp/whatsapp.service.js */ 
+/* caminho: api/src/services/whatsapp/whatsapp.service.js */
