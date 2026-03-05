@@ -14,6 +14,7 @@ const fs = require("fs");
 
 const { pool } = require("../../db");
 
+/* SSE CENTRAL */
 const { sseBroadcast } = require("../sse/sse.service");
 
 // sessões em memória por tenant
@@ -341,8 +342,6 @@ async function startSession(tenantId, options = {}) {
       /* ---------- SSE BROADCAST ---------- */
 
       try {
-        const { sseBroadcast } = require("../sse/sse.service");
-
         sseBroadcast(t, "message", {
           tenant_id: t,
           conversation_id: conversationId,
