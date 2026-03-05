@@ -9,54 +9,15 @@ const requireTenant = require("../middlewares/requireTenant");
 const whatsappService = require("../services/whatsapp/whatsapp.service");
 const { getSession, sendText, sendTextToJid } = whatsappService;
 
+// ✅ NOVO SSE SERVICE CENTRAL
+const {
+  sseAddClient,
+  sseRemoveClient,
+  sseBroadcast,
+} = require("../services/sse/sse.service");
+
 // Todas as rotas do inbox exigem tenant
 router.use(requireTenant);
-
-/**
- * SSE (Server-Sent Events) - registry simples em memória (por tenant)
- * - Front abre conexão e recebe eventos em tempo real
- * - Nesta fase, emitimos no envio "out" pelo Inbox.
- * - Próximo passo: plugar o messages.upsert do Baileys para emitir também os "in".
- */
-if (!global.__plugconversa_sse_clients) {
-  global.__plugconversa_sse_clients = new Map(); // tenantId => Set(res)
-}
-
-function sseAddClient(tenantId, res) {
-  const map = global.__plugconversa_sse_clients;
-  if (!map.has(tenantId)) map.set(tenantId, new Set());
-  map.get(tenantId).add(res);
-}
-
-function sseRemoveClient(tenantId, res) {
-  const map = global.__plugconversa_sse_clients;
-  const set = map.get(tenantId);
-  if (!set) return;
-  set.delete(res);
-  if (set.size === 0) map.delete(tenantId);
-}
-
-function sseBroadcast(tenantId, eventName, payload) {
-  const map = global.__plugconversa_sse_clients;
-  const set = map.get(tenantId);
-  if (!set || set.size === 0) return;
-
-  const data = JSON.stringify(payload ?? {});
-  for (const res of set) {
-    try {
-      res.write(`event: ${eventName}\n`);
-      res.write(`data: ${data}\n\n`);
-    } catch (e) {
-      // Se falhar, remove (conexão provavelmente caiu)
-      try {
-        sseRemoveClient(tenantId, res);
-      } catch (_) {}
-    }
-  }
-}
-
-// ✅ expõe broadcast global para ser usado no whatsapp.service.js (incoming)
-global.__plugconversa_sse_broadcast = sseBroadcast;
 
 /**
  * GET /api/inbox/events
@@ -216,7 +177,6 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       });
     }
 
-    // ✅ valida sessão em memória
     const session = getSession(tenantId);
     if (!session?.sock) {
       return res.status(400).json({
@@ -234,7 +194,6 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
 
     await client.query("BEGIN");
 
-    // ✅ pega destino (whatsapp_jid e phone)
     const convResult = await client.query(
       `
       SELECT c.id, ct.phone, ct.whatsapp_jid
@@ -318,7 +277,6 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
 
     await client.query("COMMIT");
 
-    // ✅ emite SSE (out)
     const payload = {
       tenant_id: tenantId,
       conversation_id: conversationId,
@@ -326,169 +284,12 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       message: r.rows[0],
     };
 
-    // novo (padrão)
     sseBroadcast(tenantId, "message:new", payload);
-    // compat (se algo antigo estiver ouvindo)
     sseBroadcast(tenantId, "message", payload);
 
     return res.status(201).json({
       ok: true,
       data: r.rows[0],
-    });
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (e) {}
-    return next(err);
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * POST /api/inbox/contacts/:contact_id/messages
- * (mantido como estava)
- */
-router.post("/contacts/:contact_id/messages", async (req, res, next) => {
-  const client = await pool.connect();
-
-  try {
-    const tenantId = req.tenant_id;
-    const contactId = Number(req.params.contact_id);
-    const {
-      content,
-      sender_type = "user",
-      sender_id = null,
-      assigned_user_id = null,
-    } = req.body;
-
-    if (!Number.isInteger(contactId) || contactId <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "INVALID_CONTACT_ID",
-      });
-    }
-
-    if (!content || !String(content).trim()) {
-      return res.status(400).json({
-        ok: false,
-        error: "CONTENT_REQUIRED",
-      });
-    }
-
-    await client.query("BEGIN");
-
-    // 1) Garante que o contact existe no tenant
-    const contactCheck = await client.query(
-      `
-      SELECT id, name, phone
-      FROM contacts
-      WHERE tenant_id = $1
-        AND id = $2
-      `,
-      [tenantId, contactId]
-    );
-
-    if (contactCheck.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        ok: false,
-        error: "CONTACT_NOT_FOUND",
-      });
-    }
-
-    // 2) Busca conversation aberta desse contact
-    const convFind = await client.query(
-      `
-      SELECT id, status, assigned_user_id, last_message_at, created_at, updated_at
-      FROM conversations
-      WHERE tenant_id = $1
-        AND contact_id = $2
-        AND status = 'open'
-      ORDER BY last_message_at DESC NULLS LAST, id DESC
-      LIMIT 1
-      `,
-      [tenantId, contactId]
-    );
-
-    let conversation = convFind.rows[0];
-
-    // 3) Se não existir, cria
-    if (!conversation) {
-      const convCreate = await client.query(
-        `
-        INSERT INTO conversations (
-          tenant_id,
-          contact_id,
-          assigned_user_id,
-          status,
-          last_message_at
-        )
-        VALUES ($1, $2, $3, 'open', NOW())
-        RETURNING *
-        `,
-        [tenantId, contactId, assigned_user_id]
-      );
-
-      conversation = convCreate.rows[0];
-    }
-
-    // 4) Insere mensagem
-    const msgInsert = await client.query(
-      `
-      INSERT INTO messages (
-        tenant_id,
-        conversation_id,
-        sender_type,
-        sender_id,
-        content
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING *
-      `,
-      [
-        tenantId,
-        conversation.id,
-        sender_type,
-        sender_id,
-        String(content).trim(),
-      ]
-    );
-
-    const message = msgInsert.rows[0];
-
-    // 5) Atualiza last_message_at da conversation
-    await client.query(
-      `
-      UPDATE conversations
-      SET last_message_at = NOW(),
-          updated_at = NOW()
-      WHERE tenant_id = $1
-        AND id = $2
-      `,
-      [tenantId, conversation.id]
-    );
-
-    await client.query("COMMIT");
-
-    // ✅ emite SSE (out/local)
-    const payload = {
-      tenant_id: tenantId,
-      conversation_id: conversation.id,
-      message_id: message?.id,
-      message,
-    };
-
-    sseBroadcast(tenantId, "message:new", payload);
-    sseBroadcast(tenantId, "message", payload);
-
-    return res.status(201).json({
-      ok: true,
-      data: {
-        conversation_id: conversation.id,
-        conversation,
-        message,
-      },
     });
   } catch (err) {
     try {
