@@ -13,8 +13,88 @@ const { getSession, sendText, sendTextToJid } = whatsappService;
 router.use(requireTenant);
 
 /**
+ * SSE (Server-Sent Events) - registry simples em memória (por tenant)
+ * - Front abre conexão e recebe eventos em tempo real
+ * - Nesta fase, emitimos no envio "out" pelo Inbox.
+ * - Próximo passo: plugar o messages.upsert do Baileys para emitir também os "in".
+ */
+if (!global.__plugconversa_sse_clients) {
+  global.__plugconversa_sse_clients = new Map(); // tenantId => Set(res)
+}
+
+function sseAddClient(tenantId, res) {
+  const map = global.__plugconversa_sse_clients;
+  if (!map.has(tenantId)) map.set(tenantId, new Set());
+  map.get(tenantId).add(res);
+}
+
+function sseRemoveClient(tenantId, res) {
+  const map = global.__plugconversa_sse_clients;
+  const set = map.get(tenantId);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) map.delete(tenantId);
+}
+
+function sseBroadcast(tenantId, eventName, payload) {
+  const map = global.__plugconversa_sse_clients;
+  const set = map.get(tenantId);
+  if (!set || set.size === 0) return;
+
+  const data = JSON.stringify(payload ?? {});
+  for (const res of set) {
+    try {
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${data}\n\n`);
+    } catch (e) {
+      // Se falhar, remove (conexão provavelmente caiu)
+      try {
+        sseRemoveClient(tenantId, res);
+      } catch (_) {}
+    }
+  }
+}
+
+/**
+ * GET /api/inbox/events
+ * SSE stream para o frontend receber eventos em tempo real
+ */
+router.get("/events", async (req, res) => {
+  const tenantId = req.tenant_id;
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+
+  // Se estiver atrás de proxy (nginx), ajuda a evitar buffering
+  res.setHeader("X-Accel-Buffering", "no");
+
+  // "abre" o stream
+  res.write(`event: ready\n`);
+  res.write(`data: ${JSON.stringify({ ok: true })}\n\n`);
+
+  sseAddClient(tenantId, res);
+
+  // keep-alive a cada 25s
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`event: ping\n`);
+      res.write(`data: ${JSON.stringify({ t: Date.now() })}\n\n`);
+    } catch (e) {}
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseRemoveClient(tenantId, res);
+  });
+});
+
+/**
  * GET /api/inbox/conversations
  * Lista conversas do tenant
+ * - ordenação: last_message_at DESC
+ * - inclui contact.name, contact.phone, contact.whatsapp_jid
+ * - inclui contador unread (placeholder por enquanto)
  */
 router.get("/conversations", async (req, res, next) => {
   try {
@@ -30,7 +110,9 @@ router.get("/conversations", async (req, res, next) => {
         c.updated_at,
         ct.id   AS contact_id,
         ct.name AS contact_name,
-        ct.phone AS contact_phone
+        ct.phone AS contact_phone,
+        ct.whatsapp_jid AS contact_whatsapp_jid,
+        0::int AS unread_count
       FROM conversations c
       INNER JOIN contacts ct
         ON ct.id = c.contact_id
@@ -53,6 +135,9 @@ router.get("/conversations", async (req, res, next) => {
 
 /**
  * GET /api/inbox/conversations/:id/messages
+ * - paginado (limit/offset)
+ * - ordenado por created_at ASC
+ * - inclui direction
  */
 router.get("/conversations/:id/messages", async (req, res, next) => {
   try {
@@ -66,24 +151,34 @@ router.get("/conversations/:id/messages", async (req, res, next) => {
       });
     }
 
+    const limitRaw = Number(req.query.limit ?? 50);
+    const offsetRaw = Number(req.query.offset ?? 0);
+
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
+
     const q = `
       SELECT
         id,
         sender_type,
         sender_id,
+        direction,
         content,
         created_at
       FROM messages
       WHERE tenant_id = $1
         AND conversation_id = $2
-      ORDER BY created_at ASC
+      ORDER BY created_at ASC, id ASC
+      LIMIT $3
+      OFFSET $4
     `;
 
-    const r = await pool.query(q, [tenantId, conversationId]);
+    const r = await pool.query(q, [tenantId, conversationId, limit, offset]);
 
     return res.status(200).json({
       ok: true,
       data: r.rows,
+      paging: { limit, offset, count: r.rows.length },
     });
   } catch (err) {
     return next(err);
@@ -93,7 +188,8 @@ router.get("/conversations/:id/messages", async (req, res, next) => {
 /**
  * POST /api/inbox/conversations/:id/messages
  * ✅ envia WhatsApp real + salva no banco
- * ✅ AJUSTE: prioriza whatsapp_jid (ex: ...@lid)
+ * ✅ prioriza whatsapp_jid (ex: ...@lid)
+ * ✅ não cria novos contatos
  */
 router.post("/conversations/:id/messages", async (req, res, next) => {
   const client = await pool.connect();
@@ -217,6 +313,13 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
     );
 
     await client.query("COMMIT");
+
+    // ✅ emite SSE (out)
+    sseBroadcast(tenantId, "message", {
+      tenant_id: tenantId,
+      conversation_id: conversationId,
+      message: r.rows[0],
+    });
 
     return res.status(201).json({
       ok: true,
@@ -357,6 +460,13 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
     );
 
     await client.query("COMMIT");
+
+    // ✅ emite SSE (out/local)
+    sseBroadcast(tenantId, "message", {
+      tenant_id: tenantId,
+      conversation_id: conversation.id,
+      message,
+    });
 
     return res.status(201).json({
       ok: true,
