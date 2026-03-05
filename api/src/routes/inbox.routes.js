@@ -55,6 +55,9 @@ function sseBroadcast(tenantId, eventName, payload) {
   }
 }
 
+// ✅ expõe broadcast global para ser usado no whatsapp.service.js (incoming)
+global.__plugconversa_sse_broadcast = sseBroadcast;
+
 /**
  * GET /api/inbox/events
  * SSE stream para o frontend receber eventos em tempo real
@@ -267,7 +270,8 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
         );
         providerMessageId = sent?.providerMessageId || null;
       } else {
-        await sendText(tenantId, phone, String(content).trim());
+        const sent = await sendText(tenantId, phone, String(content).trim());
+        providerMessageId = sent?.providerMessageId || null;
       }
     } catch (e) {
       await client.query("ROLLBACK");
@@ -315,11 +319,17 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
     await client.query("COMMIT");
 
     // ✅ emite SSE (out)
-    sseBroadcast(tenantId, "message", {
+    const payload = {
       tenant_id: tenantId,
       conversation_id: conversationId,
+      message_id: r.rows[0]?.id,
       message: r.rows[0],
-    });
+    };
+
+    // novo (padrão)
+    sseBroadcast(tenantId, "message:new", payload);
+    // compat (se algo antigo estiver ouvindo)
+    sseBroadcast(tenantId, "message", payload);
 
     return res.status(201).json({
       ok: true,
@@ -462,11 +472,15 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
     await client.query("COMMIT");
 
     // ✅ emite SSE (out/local)
-    sseBroadcast(tenantId, "message", {
+    const payload = {
       tenant_id: tenantId,
       conversation_id: conversation.id,
+      message_id: message?.id,
       message,
-    });
+    };
+
+    sseBroadcast(tenantId, "message:new", payload);
+    sseBroadcast(tenantId, "message", payload);
 
     return res.status(201).json({
       ok: true,
