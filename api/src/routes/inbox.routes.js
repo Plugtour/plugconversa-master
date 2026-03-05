@@ -5,58 +5,15 @@ const router = express.Router();
 const { pool } = require("../db");
 const requireTenant = require("../middlewares/requireTenant");
 
+// ✅ SSE central
+const { sseAddClient, sseRemoveClient, sseBroadcast } = require("../services/sse/sse.service");
+
 // ✅ Baileys service
 const whatsappService = require("../services/whatsapp/whatsapp.service");
 const { getSession, sendText, sendTextToJid } = whatsappService;
 
 // Todas as rotas do inbox exigem tenant
 router.use(requireTenant);
-
-/**
- * SSE (Server-Sent Events) - registry simples em memória (por tenant)
- * - Front abre conexão e recebe eventos em tempo real
- * - Nesta fase, emitimos no envio "out" pelo Inbox.
- * - Próximo passo: plugar o messages.upsert do Baileys para emitir também os "in".
- */
-if (!global.__plugconversa_sse_clients) {
-  global.__plugconversa_sse_clients = new Map(); // tenantId => Set(res)
-}
-
-function sseAddClient(tenantId, res) {
-  const map = global.__plugconversa_sse_clients;
-  if (!map.has(tenantId)) map.set(tenantId, new Set());
-  map.get(tenantId).add(res);
-}
-
-function sseRemoveClient(tenantId, res) {
-  const map = global.__plugconversa_sse_clients;
-  const set = map.get(tenantId);
-  if (!set) return;
-  set.delete(res);
-  if (set.size === 0) map.delete(tenantId);
-}
-
-function sseBroadcast(tenantId, eventName, payload) {
-  const map = global.__plugconversa_sse_clients;
-  const set = map.get(tenantId);
-  if (!set || set.size === 0) return;
-
-  const data = JSON.stringify(payload ?? {});
-  for (const res of set) {
-    try {
-      res.write(`event: ${eventName}\n`);
-      res.write(`data: ${data}\n\n`);
-    } catch (e) {
-      // Se falhar, remove (conexão provavelmente caiu)
-      try {
-        sseRemoveClient(tenantId, res);
-      } catch (_) {}
-    }
-  }
-}
-
-/** ✅ ADICIONADO: expõe broadcast global para o whatsapp.service.js (incoming) */
-global.__plugconversa_sse_broadcast = sseBroadcast;
 
 /**
  * GET /api/inbox/events
@@ -97,11 +54,11 @@ router.get("/events", async (req, res) => {
  * Lista conversas do tenant
  * - ordenação: last_message_at DESC
  * - inclui contact.name, contact.phone, contact.whatsapp_jid
- * - ✅ inclui last_message_preview (para exibir no bloco de conversas)
+ * - ✅ inclui preview do último texto (last_message_preview)
  * - ✅ unread_count real via conversation_participants.last_read_at
  *
  * Observação:
- * - Como ainda não temos autenticação de usuário no Inbox, usamos um "participante global do tenant"
+ * - como ainda não temos autenticação no Inbox, usamos um "participante global do tenant"
  *   com participant_type='tenant' e participant_id=0.
  */
 router.get("/conversations", async (req, res, next) => {
@@ -114,9 +71,9 @@ router.get("/conversations", async (req, res, next) => {
         c.status,
         c.assigned_user_id,
         c.last_message_at,
-        c.last_message_preview,
         c.created_at,
         c.updated_at,
+        c.last_message_preview,
         ct.id   AS contact_id,
         ct.name AS contact_name,
         ct.phone AS contact_phone,
@@ -175,7 +132,6 @@ router.post("/conversations/:id/read", async (req, res, next) => {
 
     await client.query("BEGIN");
 
-    // garante que a conversa existe no tenant
     const convCheck = await client.query(
       `
       SELECT id
@@ -195,7 +151,6 @@ router.post("/conversations/:id/read", async (req, res, next) => {
       });
     }
 
-    // upsert do "read cursor" global do tenant
     await client.query(
       `
       INSERT INTO conversation_participants (
@@ -253,9 +208,7 @@ router.get("/conversations/:id/messages", async (req, res, next) => {
     const limitRaw = Number(req.query.limit ?? 50);
     const offsetRaw = Number(req.query.offset ?? 0);
 
-    const limit = Number.isFinite(limitRaw)
-      ? Math.min(Math.max(limitRaw, 1), 200)
-      : 50;
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
     const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
 
     const q = `
@@ -361,15 +314,10 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
 
     try {
       if (whatsapp_jid && typeof sendTextToJid === "function") {
-        const sent = await sendTextToJid(
-          tenantId,
-          String(whatsapp_jid),
-          String(content).trim()
-        );
+        const sent = await sendTextToJid(tenantId, String(whatsapp_jid), String(content).trim());
         providerMessageId = sent?.providerMessageId || null;
       } else {
-        const sent = await sendText(tenantId, phone, String(content).trim());
-        providerMessageId = sent?.providerMessageId || null;
+        await sendText(tenantId, phone, String(content).trim());
       }
     } catch (e) {
       await client.query("ROLLBACK");
@@ -403,7 +351,6 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       String(content).trim(),
     ]);
 
-    // ✅ atualiza conversa + preview (para lista do Inbox)
     await client.query(
       `
       UPDATE conversations
@@ -449,12 +396,7 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
   try {
     const tenantId = req.tenant_id;
     const contactId = Number(req.params.contact_id);
-    const {
-      content,
-      sender_type = "user",
-      sender_id = null,
-      assigned_user_id = null,
-    } = req.body;
+    const { content, sender_type = "user", sender_id = null, assigned_user_id = null } = req.body;
 
     if (!Number.isInteger(contactId) || contactId <= 0) {
       return res.status(400).json({
@@ -516,13 +458,12 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
           contact_id,
           assigned_user_id,
           status,
-          last_message_at,
-          last_message_preview
+          last_message_at
         )
-        VALUES ($1, $2, $3, 'open', NOW(), $4)
+        VALUES ($1, $2, $3, 'open', NOW())
         RETURNING *
         `,
-        [tenantId, contactId, assigned_user_id, String(content).trim().slice(0, 120)]
+        [tenantId, contactId, assigned_user_id]
       );
 
       conversation = convCreate.rows[0];
@@ -541,27 +482,21 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
       VALUES ($1, $2, $3, $4, $5)
       RETURNING *
       `,
-      [
-        tenantId,
-        conversation.id,
-        sender_type,
-        sender_id,
-        String(content).trim(),
-      ]
+      [tenantId, conversation.id, sender_type, sender_id, String(content).trim()]
     );
 
     const message = msgInsert.rows[0];
 
-    // 5) Atualiza last_message_at + preview da conversation
+    // 5) Atualiza last_message_at da conversation + preview
     await client.query(
       `
-      UPDATE conversations
-      SET last_message_preview = $3,
-          last_message_at = NOW(),
-          updated_at = NOW()
-      WHERE tenant_id = $1
-        AND id = $2
-      `,
+        UPDATE conversations
+        SET last_message_preview = $3,
+            last_message_at = NOW(),
+            updated_at = NOW()
+        WHERE tenant_id = $1
+          AND id = $2
+        `,
       [tenantId, conversation.id, String(content).trim().slice(0, 120)]
     );
 
