@@ -98,6 +98,7 @@ router.get("/events", async (req, res) => {
  * - ordenação: last_message_at DESC
  * - inclui contact.name, contact.phone, contact.whatsapp_jid
  * - inclui contador unread (placeholder por enquanto)
+ * - ✅ inclui last_message_preview (para exibir no bloco de conversas)
  */
 router.get("/conversations", async (req, res, next) => {
   try {
@@ -109,6 +110,7 @@ router.get("/conversations", async (req, res, next) => {
         c.status,
         c.assigned_user_id,
         c.last_message_at,
+        c.last_message_preview,
         c.created_at,
         c.updated_at,
         ct.id   AS contact_id,
@@ -307,15 +309,17 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
       String(content).trim(),
     ]);
 
+    // ✅ atualiza conversa + preview (para lista do Inbox)
     await client.query(
       `
       UPDATE conversations
-      SET last_message_at = NOW(),
+      SET last_message_preview = $3,
+          last_message_at = NOW(),
           updated_at = NOW()
       WHERE tenant_id = $1
         AND id = $2
       `,
-      [tenantId, conversationId]
+      [tenantId, conversationId, String(content).trim().slice(0, 120)]
     );
 
     await client.query("COMMIT");
@@ -418,12 +422,13 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
           contact_id,
           assigned_user_id,
           status,
-          last_message_at
+          last_message_at,
+          last_message_preview
         )
-        VALUES ($1, $2, $3, 'open', NOW())
+        VALUES ($1, $2, $3, 'open', NOW(), $4)
         RETURNING *
         `,
-        [tenantId, contactId, assigned_user_id]
+        [tenantId, contactId, assigned_user_id, String(content).trim().slice(0, 120)]
       );
 
       conversation = convCreate.rows[0];
@@ -453,16 +458,17 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
 
     const message = msgInsert.rows[0];
 
-    // 5) Atualiza last_message_at da conversation
+    // 5) Atualiza last_message_at + preview da conversation
     await client.query(
       `
       UPDATE conversations
-      SET last_message_at = NOW(),
+      SET last_message_preview = $3,
+          last_message_at = NOW(),
           updated_at = NOW()
       WHERE tenant_id = $1
         AND id = $2
       `,
-      [tenantId, conversation.id]
+      [tenantId, conversation.id, String(content).trim().slice(0, 120)]
     );
 
     await client.query("COMMIT");

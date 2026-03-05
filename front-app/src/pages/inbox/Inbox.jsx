@@ -1,9 +1,11 @@
 /* caminho: front-app/src/pages/inbox/Inbox.jsx */
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import "./inbox.css";
 import ConversationList from "./block1/ConversationList.jsx";
 import ChatBody from "./block2/ChatBody.jsx";
 import Composer from "./block2/Composer.jsx";
+
+import { connectInboxSSE, subscribeInboxMessages } from "../../services/sse";
 
 function Inbox() {
   const [selectedConversation, setSelectedConversation] = useState(null);
@@ -11,12 +13,30 @@ function Inbox() {
 
   function handleSelectConversation(conv) {
     setSelectedConversation(conv);
-    setRefreshKey((v) => v + 1); // força carregar mensagens ao trocar conversa
+    setRefreshKey((v) => v + 1);
   }
 
   function handleSent() {
-    setRefreshKey((v) => v + 1); // força recarregar após envio
+    setRefreshKey((v) => v + 1);
   }
+
+  useEffect(() => {
+    const sse = connectInboxSSE();
+
+    const unsubscribe = subscribeInboxMessages((payload) => {
+      const { conversation_id } = payload || {};
+
+      if (!conversation_id) return;
+
+      if (selectedConversation?.id === conversation_id) {
+        setRefreshKey((v) => v + 1);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [selectedConversation]);
 
   return (
     <div className="pcPage">

@@ -279,7 +279,7 @@ async function startSession(tenantId, options = {}) {
 
       const contactResult = await client.query(
         `
-        SELECT id
+        SELECT id, name, whatsapp_jid
           FROM contacts
           WHERE tenant_id = $1
             AND (whatsapp_jid = $2 OR phone = $3)
@@ -301,6 +301,34 @@ async function startSession(tenantId, options = {}) {
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
+
+        // mantém o jid atualizado
+        if (contactResult.rows[0].whatsapp_jid !== remoteJid) {
+          await client.query(
+            `
+            UPDATE contacts
+            SET whatsapp_jid = $3,
+                updated_at = NOW()
+            WHERE tenant_id = $1
+              AND id = $2
+            `,
+            [t, contactId, remoteJid]
+          );
+        }
+
+        // se veio pushName e o nome atual está vazio, preenche
+        if (pushName) {
+          await client.query(
+            `
+            UPDATE contacts
+            SET name = COALESCE(NULLIF(name, ''), $3),
+                updated_at = NOW()
+            WHERE tenant_id = $1
+              AND id = $2
+            `,
+            [t, contactId, pushName]
+          );
+        }
       }
 
       const convUpsert = await client.query(
@@ -334,6 +362,19 @@ async function startSession(tenantId, options = {}) {
       );
 
       const insertedMessage = msgInsert.rows[0];
+
+      // 4) atualiza preview da conversa (lista do Inbox)
+      await client.query(
+        `
+        UPDATE conversations
+        SET last_message_preview = $3,
+            last_message_at = NOW(),
+            updated_at = NOW()
+        WHERE tenant_id = $1
+          AND id = $2
+        `,
+        [t, conversationId, String(text).slice(0, 120)]
+      );
 
       await client.query("COMMIT");
 
