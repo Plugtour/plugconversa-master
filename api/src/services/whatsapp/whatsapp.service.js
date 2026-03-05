@@ -901,4 +901,4 @@ module.exports = {
   resolveJidByPhone,
 };
 
-/* caminho: api/src/services/whatsapp/whatsapp.service.js */
+/* caminho: api/src/services/whatsapp/whatsapp.service.js */ 
