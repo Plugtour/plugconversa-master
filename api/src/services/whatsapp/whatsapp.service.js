@@ -520,7 +520,6 @@ async function startSession(tenantId, options = {}) {
   /**
    * ✅ INCOMING (aceita @s.whatsapp.net e @lid)
    * - salva em contacts/conversations/messages
-   * - IMPORTANTe: direction='in' (senão fica 'out' pelo default do banco)
    */
   sock.ev.on("messages.upsert", async (payload) => {
     const { messages, type } = payload || {};
@@ -669,8 +668,8 @@ async function startSession(tenantId, options = {}) {
 
       const conversationId = convUpsert.rows[0].id;
 
-      // 3) message (direction='in') + capturar pra SSE
-      const inserted = await client.query(
+      // 3) message (direction='in') + RETURNING para SSE
+      const msgInsert = await client.query(
         `
         INSERT INTO messages (
           tenant_id,
@@ -686,12 +685,12 @@ async function startSession(tenantId, options = {}) {
         [t, conversationId, providerMessageId, String(text)]
       );
 
-      const insertedMessage = inserted.rows[0];
+      const insertedMessage = msgInsert.rows[0];
 
       await client.query("COMMIT");
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
 
-      // ✅ SSE broadcast (mensagem recebida)
+      // ✅ SSE broadcast (mensagem recebida) - depois do COMMIT
       try {
         const map = global.__plugconversa_sse_clients;
         const set = map?.get(t);
