@@ -175,64 +175,6 @@ function getSession(tenantId) {
 }
 
 /**
- * ✅ Resolve JID a partir de phone (somente números)
- * - consulta o WhatsApp via Baileys (sock.onWhatsApp)
- * - retorna info suficiente para normalização (@lid vs @s.whatsapp.net)
- */
-async function resolveJidByPhone(tenantId, phone) {
-  const t = normalizeTenantId(tenantId);
-  if (!t) throw new Error("INVALID_TENANT_ID");
-
-  const s = getSession(t);
-  if (!s?.sock) throw new Error("WHATSAPP_SESSION_NOT_STARTED");
-
-  // garante que a sessão realmente conectou
-  if (!s.sock.user?.id) throw new Error("WHATSAPP_NOT_CONNECTED");
-
-  const cleanPhone = String(phone || "").replace(/\D/g, "");
-  if (!cleanPhone) throw new Error("PHONE_REQUIRED");
-
-  // onWhatsApp espera um jid @s.whatsapp.net
-  const jid = `${cleanPhone}@s.whatsapp.net`;
-
-  if (typeof s.sock.onWhatsApp !== "function") {
-    throw new Error("ONWHATSAPP_NOT_SUPPORTED_BY_BAILEYS");
-  }
-
-  const timeoutMs = Number(process.env.WA_RESOLVE_TIMEOUT_MS || 8000);
-
-  log(t, "resolveJidByPhone => consultando onWhatsApp", { jid, timeoutMs });
-
-  const result = await withTimeout(
-    s.sock.onWhatsApp(jid),
-    timeoutMs,
-    "ON_WHATSAPP"
-  );
-
-  // formatos comuns do Baileys: array com { jid, exists, ... } e às vezes lid
-  const row = Array.isArray(result) ? result[0] : result;
-
-  const exists = !!row?.exists;
-  const resolvedJid = row?.jid ? String(row.jid) : jid;
-
-  // algumas versões trazem lid separado
-  const lid = row?.lid ? String(row.lid) : null;
-
-  log(t, "resolveJidByPhone => resultado", { exists, resolvedJid, lid });
-
-  return {
-    ok: true,
-    exists,
-    input: { phone: cleanPhone, jid },
-    resolved: {
-      jid: resolvedJid,
-      lid,
-    },
-    raw: row || null,
-  };
-}
-
-/**
  * ✅ NOVO: envia para um JID já pronto
  * - suporta @lid e @s.whatsapp.net
  * - retorna providerMessageId (quando disponível)
@@ -656,105 +598,19 @@ async function startSession(tenantId, options = {}) {
 
     const client = await pool.connect();
 
-    // ✅ vamos capturar ids para SSE (sem mudar lógica já validada)
-    let outConversationId = null;
-    let outInsertedMessage = null;
-
     try {
       await client.query("BEGIN");
 
-      const isLid = String(remoteJid || "").endsWith("@lid");
-      const legacyLidPhone = isLid ? String(remoteJid).replace("@lid", "") : null;
-
-      // ✅ suporte "alternância": quando vem @s.whatsapp.net, tentamos localizar também pelo padrão @lid derivado
-      const isSwa = String(remoteJid || "").endsWith("@s.whatsapp.net");
-      const derivedLidJid = isSwa ? `${String(phone)}@lid` : null; // só dígitos + @lid
-      const derivedLidPhone = isSwa ? `lid:${derivedLidJid}` : null; // lid:<digits>@lid
-
-      // 1) contact (blindado contra duplicação lid vs legado)
-      let contactResult;
-
-      if (isLid) {
-        // 1) por whatsapp_jid (mais forte)
-        contactResult = await client.query(
-          `
-          SELECT id, phone
+      // 1) contact (usa pushName quando existir)
+      const contactResult = await client.query(
+        `
+        SELECT id
           FROM contacts
           WHERE tenant_id = $1
-            AND whatsapp_jid = $2
-          LIMIT 1
-          `,
-          [t, remoteJid]
-        );
-
-        // 2) por phone novo (lid:<jid>)
-        if (contactResult.rowCount === 0) {
-          contactResult = await client.query(
-            `
-            SELECT id, phone
-            FROM contacts
-            WHERE tenant_id = $1
-              AND phone = $2
-            LIMIT 1
-            `,
-            [t, phone]
-          );
-        }
-
-        // 3) por phone legado (sem prefixo)
-        if (contactResult.rowCount === 0 && legacyLidPhone) {
-          contactResult = await client.query(
-            `
-            SELECT id, phone
-            FROM contacts
-            WHERE tenant_id = $1
-              AND phone = $2
-            LIMIT 1
-            `,
-            [t, legacyLidPhone]
-          );
-        }
-      } else {
-        // não-lid: primeiro por phone numérico (regra atual)
-        contactResult = await client.query(
-          `
-          SELECT id, phone
-          FROM contacts
-          WHERE tenant_id = $1
-            AND phone = $2
-          LIMIT 1
-          `,
-          [t, phone]
-        );
-
-        // ✅ 2) por whatsapp_jid exato (caso já exista salvo assim)
-        if (contactResult.rowCount === 0) {
-          contactResult = await client.query(
-            `
-            SELECT id, phone
-            FROM contacts
-            WHERE tenant_id = $1
-              AND whatsapp_jid = $2
-            LIMIT 1
-            `,
-            [t, remoteJid]
-          );
-        }
-
-        // ✅ 3) por variações derivadas (@lid) — evita duplicar quando o contato já foi migrado pra lid:...
-        if (contactResult.rowCount === 0 && derivedLidPhone) {
-          contactResult = await client.query(
-            `
-            SELECT id, phone
-            FROM contacts
-            WHERE tenant_id = $1
-              AND (phone = $2 OR whatsapp_jid = $3)
-            LIMIT 1
-            `,
-            [t, derivedLidPhone, derivedLidJid]
-          );
-        }
-      }
+            AND (whatsapp_jid = $2 OR phone = $3)
+          LIMIT 1`,
+        [t, remoteJid, phone]
+      );
 
       let contactId;
 
@@ -770,7 +626,6 @@ async function startSession(tenantId, options = {}) {
         contactId = insert.rows[0].id;
       } else {
         contactId = contactResult.rows[0].id;
-        const existingPhone = contactResult.rows[0].phone ? String(contactResult.rows[0].phone) : "";
 
         // atualiza jid sempre que vier mensagem nova
         await client.query(
@@ -783,27 +638,6 @@ async function startSession(tenantId, options = {}) {
           `,
           [t, contactId, remoteJid]
         );
-
-        // migra phone legado -> phone novo lid:<jid>
-        if (isLid && existingPhone && existingPhone !== phone) {
-          // só migra se era o legado (digits) ou algo que não seja lid:/jid:
-          const canMigrate =
-            existingPhone === legacyLidPhone ||
-            (!existingPhone.startsWith("lid:") && !existingPhone.startsWith("jid:"));
-
-          if (canMigrate) {
-            await client.query(
-              `
-              UPDATE contacts
-              SET phone = $3,
-                  updated_at = NOW()
-              WHERE tenant_id = $1
-                AND id = $2
-              `,
-              [t, contactId, phone]
-            );
-          }
-        }
 
         // atualiza nome se veio pushName e ainda não temos nome “bom”
         if (pushName) {
@@ -834,9 +668,8 @@ async function startSession(tenantId, options = {}) {
       );
 
       const conversationId = convUpsert.rows[0].id;
-      outConversationId = conversationId;
 
-      // 3) message (direction='in')
+      // 3) message (direction='in')  ✅ ALTERADO: RETURNING p/ SSE
       const msgInsert = await client.query(
         `
         INSERT INTO messages (
@@ -853,27 +686,20 @@ async function startSession(tenantId, options = {}) {
         [t, conversationId, providerMessageId, String(text)]
       );
 
-      outInsertedMessage = msgInsert.rows[0];
+      const insertedMessage = msgInsert.rows[0];
 
       await client.query("COMMIT");
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
 
-      // ✅ SSE (mensagem recebida)
+      // ✅ SSE broadcast (mensagem recebida)
       try {
-        // ✅ GARANTE registry global (mesmo se inbox.routes ainda não tiver sido carregado)
-        if (!global.__plugconversa_sse_clients) {
-          global.__plugconversa_sse_clients = new Map(); // tenantId => Set(res)
-        }
-
-        // mesmo registry global usado no inbox.routes.js
         const map = global.__plugconversa_sse_clients;
         const set = map?.get(t);
-
         if (set && set.size > 0) {
           const payload = JSON.stringify({
             tenant_id: t,
-            conversation_id: outConversationId,
-            message: outInsertedMessage,
+            conversation_id: conversationId,
+            message: insertedMessage,
           });
 
           for (const res of set) {
@@ -905,7 +731,6 @@ module.exports = {
   sendText,
   sendTextToJid,
   requestPairingCode,
-  resolveJidByPhone,
 };
 
 /* caminho: api/src/services/whatsapp/whatsapp.service.js */
