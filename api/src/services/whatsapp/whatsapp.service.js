@@ -669,8 +669,8 @@ async function startSession(tenantId, options = {}) {
 
       const conversationId = convUpsert.rows[0].id;
 
-      // 3) message (direction='in')  ✅ ALTERADO: RETURNING p/ SSE
-      const msgInsert = await client.query(
+      // 3) message (direction='in') + capturar pra SSE
+      const inserted = await client.query(
         `
         INSERT INTO messages (
           tenant_id,
@@ -686,7 +686,7 @@ async function startSession(tenantId, options = {}) {
         [t, conversationId, providerMessageId, String(text)]
       );
 
-      const insertedMessage = msgInsert.rows[0];
+      const insertedMessage = inserted.rows[0];
 
       await client.query("COMMIT");
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
