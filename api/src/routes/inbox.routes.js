@@ -97,8 +97,12 @@ router.get("/events", async (req, res) => {
  * Lista conversas do tenant
  * - ordenação: last_message_at DESC
  * - inclui contact.name, contact.phone, contact.whatsapp_jid
- * - inclui contador unread (placeholder por enquanto)
  * - ✅ inclui last_message_preview (para exibir no bloco de conversas)
+ * - ✅ unread_count real via conversation_participants.last_read_at
+ *
+ * Observação:
+ * - Como ainda não temos autenticação de usuário no Inbox, usamos um "participante global do tenant"
+ *   com participant_type='tenant' e participant_id=0.
  */
 router.get("/conversations", async (req, res, next) => {
   try {
@@ -117,11 +121,23 @@ router.get("/conversations", async (req, res, next) => {
         ct.name AS contact_name,
         ct.phone AS contact_phone,
         ct.whatsapp_jid AS contact_whatsapp_jid,
-        0::int AS unread_count
+        COALESCE((
+          SELECT COUNT(1)::int
+          FROM messages m
+          WHERE m.tenant_id = c.tenant_id
+            AND m.conversation_id = c.id
+            AND m.direction = 'in'
+            AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01'::timestamptz)
+        ), 0) AS unread_count
       FROM conversations c
       INNER JOIN contacts ct
         ON ct.id = c.contact_id
        AND ct.tenant_id = c.tenant_id
+      LEFT JOIN conversation_participants cp
+        ON cp.tenant_id = c.tenant_id
+       AND cp.conversation_id = c.id
+       AND cp.participant_type = 'tenant'
+       AND cp.participant_id = 0
       WHERE c.tenant_id = $1
       ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC
       LIMIT 200
@@ -135,6 +151,84 @@ router.get("/conversations", async (req, res, next) => {
     });
   } catch (err) {
     return next(err);
+  }
+});
+
+/**
+ * POST /api/inbox/conversations/:id/read
+ * Marca conversa como lida (zera unread_count a partir de agora)
+ * - Usa participant_type='tenant' e participant_id=0 (global por tenant)
+ */
+router.post("/conversations/:id/read", async (req, res, next) => {
+  const client = await pool.connect();
+
+  try {
+    const tenantId = req.tenant_id;
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId) || conversationId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CONVERSATION_ID",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // garante que a conversa existe no tenant
+    const convCheck = await client.query(
+      `
+      SELECT id
+      FROM conversations
+      WHERE tenant_id = $1
+        AND id = $2
+      LIMIT 1
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (convCheck.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    // upsert do "read cursor" global do tenant
+    await client.query(
+      `
+      INSERT INTO conversation_participants (
+        tenant_id,
+        conversation_id,
+        participant_type,
+        participant_id,
+        last_read_at
+      )
+      VALUES ($1, $2, 'tenant', 0, NOW())
+      ON CONFLICT (tenant_id, conversation_id, participant_type, participant_id)
+      DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+      `,
+      [tenantId, conversationId]
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      ok: true,
+      data: {
+        tenant_id: tenantId,
+        conversation_id: conversationId,
+        last_read_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (e) {}
+    return next(err);
+  } finally {
+    client.release();
   }
 });
 
