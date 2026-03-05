@@ -656,6 +656,10 @@ async function startSession(tenantId, options = {}) {
 
     const client = await pool.connect();
 
+    // ✅ vamos capturar ids para SSE (sem mudar lógica já validada)
+    let outConversationId = null;
+    let outInsertedMessage = null;
+
     try {
       await client.query("BEGIN");
 
@@ -830,9 +834,10 @@ async function startSession(tenantId, options = {}) {
       );
 
       const conversationId = convUpsert.rows[0].id;
+      outConversationId = conversationId;
 
       // 3) message (direction='in')
-      await client.query(
+      const msgInsert = await client.query(
         `
         INSERT INTO messages (
           tenant_id,
@@ -843,12 +848,35 @@ async function startSession(tenantId, options = {}) {
           content
         )
         VALUES ($1, $2, 'in', 'contact', $3, $4)
+        RETURNING id, tenant_id, conversation_id, direction, sender_type, sender_id, provider_message_id, content, created_at
         `,
         [t, conversationId, providerMessageId, String(text)]
       );
 
+      outInsertedMessage = msgInsert.rows[0];
+
       await client.query("COMMIT");
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
+
+      // ✅ SSE (mensagem recebida)
+      try {
+        // mesmo registry global usado no inbox.routes.js
+        const map = global.__plugconversa_sse_clients;
+        const set = map?.get(t);
+        if (set && set.size > 0) {
+          const payload = JSON.stringify({
+            tenant_id: t,
+            conversation_id: outConversationId,
+            message: outInsertedMessage,
+          });
+          for (const res of set) {
+            try {
+              res.write(`event: message\n`);
+              res.write(`data: ${payload}\n\n`);
+            } catch (e) {}
+          }
+        }
+      } catch (e) {}
     } catch (err) {
       try {
         await client.query("ROLLBACK");
