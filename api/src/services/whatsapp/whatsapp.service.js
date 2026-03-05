@@ -14,9 +14,6 @@ const fs = require("fs");
 
 const { pool } = require("../../db");
 
-/* SSE CENTRAL */
-const { sseBroadcast } = require("../sse/sse.service");
-
 // sessões em memória por tenant
 const sessions = new Map();
 
@@ -146,6 +143,12 @@ function getSession(tenantId) {
   return sessions.get(t) || null;
 }
 
+/** ✅ SSE: pega broadcast do global (definido em inbox.routes.js) */
+function getSseBroadcast() {
+  const fn = global.__plugconversa_sse_broadcast;
+  return typeof fn === "function" ? fn : null;
+}
+
 async function sendTextToJid(tenantId, jid, text) {
   const s = getSession(tenantId);
 
@@ -260,13 +263,10 @@ async function startSession(tenantId, options = {}) {
     if (msg.key?.fromMe) return;
 
     const remoteJid = msg.key?.remoteJid || "";
-
     if (!isPrivateConversationJid(remoteJid)) return;
 
     const phone = extractContactKeyFromJid(remoteJid);
-
     const text = extractTextFromMessage(msg.message);
-
     if (!text) return;
 
     const pushName = msg?.pushName ? String(msg.pushName).trim() : null;
@@ -339,18 +339,26 @@ async function startSession(tenantId, options = {}) {
 
       log(t, "messages.upsert => SALVO NO BANCO", { phone, jid: remoteJid });
 
-      /* ---------- SSE BROADCAST ---------- */
-
+      /* ---------- SSE BROADCAST (incoming) ---------- */
       try {
-        sseBroadcast(t, "message", {
-          tenant_id: t,
-          conversation_id: conversationId,
-          message: insertedMessage,
-        });
+        const broadcast = getSseBroadcast();
+        if (broadcast) {
+          const payloadOut = {
+            tenant_id: t,
+            conversation_id: conversationId,
+            message: insertedMessage,
+          };
+
+          // mantém compatibilidade com quem escuta "message"
+          broadcast(t, "message", payloadOut);
+          // e também manda um "message:new" pra quem quiser padrão novo
+          broadcast(t, "message:new", payloadOut);
+        } else {
+          logErr(t, "SSE_BROADCAST_UNAVAILABLE (global não definido)");
+        }
       } catch (e) {
         logErr(t, "SSE_BROADCAST_ERROR", e?.message || e);
       }
-
     } catch (err) {
       try {
         await client.query("ROLLBACK");
