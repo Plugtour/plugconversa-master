@@ -14,6 +14,8 @@ const fs = require("fs");
 
 const { pool } = require("../../db");
 
+const { sseBroadcast } = require("../sse/sse.service");
+
 // sessões em memória por tenant
 const sessions = new Map();
 
