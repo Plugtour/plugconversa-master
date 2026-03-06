@@ -55,6 +55,7 @@ router.get("/events", async (req, res) => {
  * - ordenação: last_message_at DESC
  * - inclui contact.name, contact.phone, contact.whatsapp_jid
  * - inclui contador unread (placeholder por enquanto)
+ * - inbox principal: não traz arquivadas, ocultas ou excluídas
  */
 router.get("/conversations", async (req, res, next) => {
   try {
@@ -78,13 +79,15 @@ router.get("/conversations", async (req, res, next) => {
       INNER JOIN contacts ct
         ON ct.id = c.contact_id
        AND ct.tenant_id = c.tenant_id
-
-        LEFT JOIN conversation_participants cp
-          ON cp.tenant_id = c.tenant_id
-         AND cp.conversation_id = c.id
-         AND cp.participant_type = 'tenant'
-         AND cp.participant_id = 0
+      LEFT JOIN conversation_participants cp
+        ON cp.tenant_id = c.tenant_id
+       AND cp.conversation_id = c.id
+       AND cp.participant_type = 'tenant'
+       AND cp.participant_id = 0
       WHERE c.tenant_id = $1
+        AND c.deleted_at IS NULL
+        AND COALESCE(c.is_hidden, false) = false
+        AND COALESCE(c.is_archived, false) = false
       ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC
       LIMIT 200
     `;
@@ -94,6 +97,221 @@ router.get("/conversations", async (req, res, next) => {
     return res.status(200).json({
       ok: true,
       data: r.rows,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/inbox/conversations/:id/archive
+ * Arquiva conversa individualmente
+ */
+router.post("/conversations/:id/archive", async (req, res, next) => {
+  try {
+    const tenantId = req.tenant_id;
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId) || conversationId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CONVERSATION_ID",
+      });
+    }
+
+    const r = await pool.query(
+      `
+      UPDATE conversations
+      SET is_archived = true,
+          archived_at = NOW(),
+          is_hidden = false,
+          hidden_at = NULL,
+          updated_at = NOW()
+      WHERE tenant_id = $1
+        AND id = $2
+        AND deleted_at IS NULL
+      RETURNING id, is_archived, archived_at, is_hidden, hidden_at, deleted_at
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    sseBroadcast(tenantId, "conversation_updated", {
+      tenant_id: tenantId,
+      conversation_id: conversationId,
+      action: "archive",
+      conversation: r.rows[0],
+    });
+
+    return res.status(200).json({
+      ok: true,
+      data: r.rows[0],
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/inbox/conversations/:id/unarchive
+ * Desarquiva conversa individualmente
+ */
+router.post("/conversations/:id/unarchive", async (req, res, next) => {
+  try {
+    const tenantId = req.tenant_id;
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId) || conversationId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CONVERSATION_ID",
+      });
+    }
+
+    const r = await pool.query(
+      `
+      UPDATE conversations
+      SET is_archived = false,
+          archived_at = NULL,
+          updated_at = NOW()
+      WHERE tenant_id = $1
+        AND id = $2
+        AND deleted_at IS NULL
+      RETURNING id, is_archived, archived_at, is_hidden, hidden_at, deleted_at
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    sseBroadcast(tenantId, "conversation_updated", {
+      tenant_id: tenantId,
+      conversation_id: conversationId,
+      action: "unarchive",
+      conversation: r.rows[0],
+    });
+
+    return res.status(200).json({
+      ok: true,
+      data: r.rows[0],
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/inbox/conversations/:id/hide
+ * Oculta conversa individualmente
+ */
+router.post("/conversations/:id/hide", async (req, res, next) => {
+  try {
+    const tenantId = req.tenant_id;
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId) || conversationId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CONVERSATION_ID",
+      });
+    }
+
+    const r = await pool.query(
+      `
+      UPDATE conversations
+      SET is_hidden = true,
+          hidden_at = NOW(),
+          is_archived = false,
+          archived_at = NULL,
+          updated_at = NOW()
+      WHERE tenant_id = $1
+        AND id = $2
+        AND deleted_at IS NULL
+      RETURNING id, is_archived, archived_at, is_hidden, hidden_at, deleted_at
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    sseBroadcast(tenantId, "conversation_updated", {
+      tenant_id: tenantId,
+      conversation_id: conversationId,
+      action: "hide",
+      conversation: r.rows[0],
+    });
+
+    return res.status(200).json({
+      ok: true,
+      data: r.rows[0],
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /api/inbox/conversations/:id
+ * Exclusão lógica de conversa individual
+ */
+router.delete("/conversations/:id", async (req, res, next) => {
+  try {
+    const tenantId = req.tenant_id;
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId) || conversationId <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CONVERSATION_ID",
+      });
+    }
+
+    const r = await pool.query(
+      `
+      UPDATE conversations
+      SET deleted_at = NOW(),
+          updated_at = NOW()
+      WHERE tenant_id = $1
+        AND id = $2
+        AND deleted_at IS NULL
+      RETURNING id, is_archived, archived_at, is_hidden, hidden_at, deleted_at
+      `,
+      [tenantId, conversationId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "CONVERSATION_NOT_FOUND",
+      });
+    }
+
+    sseBroadcast(tenantId, "conversation_updated", {
+      tenant_id: tenantId,
+      conversation_id: conversationId,
+      action: "delete",
+      conversation: r.rows[0],
+    });
+
+    return res.status(200).json({
+      ok: true,
+      data: r.rows[0],
     });
   } catch (err) {
     return next(err);

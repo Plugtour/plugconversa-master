@@ -21,14 +21,14 @@ function Inbox() {
   }
 
   useEffect(() => {
-    const sse = connectInboxSSE();
+    connectInboxSSE();
 
     const unsubscribe = subscribeInboxMessages((payload) => {
       const { conversation_id } = payload || {};
 
       if (!conversation_id) return;
 
-      if (selectedConversation?.id === conversation_id) {
+      if (String(selectedConversation?.id) === String(conversation_id)) {
         setRefreshKey((v) => v + 1);
       }
     });

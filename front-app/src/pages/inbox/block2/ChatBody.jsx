@@ -3,7 +3,7 @@ import { useEffect, useRef } from "react";
 import { useInboxMessages } from "../shared/useInboxHooks";
 import { subscribeInboxMessages } from "../../../services/sse";
 
-function ChatBody({ conversationId }) {
+function ChatBody({ conversationId, refreshKey }) {
   const {
     messages,
     loadingMessages,
@@ -17,14 +17,13 @@ function ChatBody({ conversationId }) {
   useEffect(() => {
     if (!conversationId) return;
     reloadMessages?.();
-  }, [conversationId, reloadMessages]);
+  }, [conversationId, refreshKey, reloadMessages]);
 
   useEffect(() => {
     const unsubscribe = subscribeInboxMessages((payload) => {
       const { conversation_id, message } = payload || {};
       if (!conversation_id || !message) return;
 
-      // ✅ correção: normaliza tipos (string/number)
       if (String(conversation_id) === String(conversationId)) {
         appendMessage(message);
       }
