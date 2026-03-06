@@ -1,16 +1,41 @@
 /* caminho: front-app/src/pages/inbox/block2/ChatBody.jsx */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useInboxMessages } from "../shared/useInboxHooks";
+import { subscribeInboxMessages } from "../../../services/sse";
 
-function ChatBody({ conversationId, refreshKey }) {
-  const { messages, loadingMessages, errorMessages, reloadMessages } =
-    useInboxMessages(conversationId);
+function ChatBody({ conversationId }) {
+  const {
+    messages,
+    loadingMessages,
+    errorMessages,
+    reloadMessages,
+    appendMessage,
+  } = useInboxMessages(conversationId);
 
-  // força recarregar quando o refreshKey mudar (ex: após envio)
+  const bottomRef = useRef(null);
+
   useEffect(() => {
     if (!conversationId) return;
     reloadMessages?.();
-  }, [conversationId, refreshKey, reloadMessages]);
+  }, [conversationId, reloadMessages]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeInboxMessages((payload) => {
+      const { conversation_id, message } = payload || {};
+
+      if (!conversation_id || !message) return;
+
+      if (String(conversation_id) === String(conversationId)) {
+        appendMessage(message);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [conversationId, appendMessage]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   if (!conversationId) return <div>Selecione uma conversa.</div>;
   if (loadingMessages) return <div>Carregando mensagens...</div>;
@@ -22,6 +47,7 @@ function ChatBody({ conversationId, refreshKey }) {
 
       {messages.map((m) => {
         const isOut = m.sender_type === "user";
+
         return (
           <div
             key={m.id}
@@ -37,6 +63,7 @@ function ChatBody({ conversationId, refreshKey }) {
             <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>
               {m.content || ""}
             </div>
+
             <div
               style={{
                 marginTop: 6,
@@ -50,6 +77,8 @@ function ChatBody({ conversationId, refreshKey }) {
           </div>
         );
       })}
+
+      <div ref={bottomRef} />
     </div>
   );
 }
