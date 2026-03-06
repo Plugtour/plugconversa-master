@@ -54,12 +54,7 @@ router.get("/events", async (req, res) => {
  * Lista conversas do tenant
  * - ordenação: last_message_at DESC
  * - inclui contact.name, contact.phone, contact.whatsapp_jid
- * - ✅ inclui preview do último texto (last_message_preview)
- * - ✅ unread_count real via conversation_participants.last_read_at
- *
- * Observação:
- * - como ainda não temos autenticação no Inbox, usamos um "participante global do tenant"
- *   com participant_type='tenant' e participant_id=0.
+ * - inclui contador unread (placeholder por enquanto)
  */
 router.get("/conversations", async (req, res, next) => {
   try {
@@ -78,23 +73,17 @@ router.get("/conversations", async (req, res, next) => {
         ct.name AS contact_name,
         ct.phone AS contact_phone,
         ct.whatsapp_jid AS contact_whatsapp_jid,
-        COALESCE((
-          SELECT COUNT(1)::int
-          FROM messages m
-          WHERE m.tenant_id = c.tenant_id
-            AND m.conversation_id = c.id
-            AND m.direction = 'in'
-            AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01'::timestamptz)
-        ), 0) AS unread_count
+        COALESCE((SELECT COUNT(1)::int FROM messages m WHERE m.tenant_id = c.tenant_id AND m.conversation_id = c.id AND m.direction = 'in' AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01'::timestamptz)),0) AS unread_count
       FROM conversations c
       INNER JOIN contacts ct
         ON ct.id = c.contact_id
        AND ct.tenant_id = c.tenant_id
-      LEFT JOIN conversation_participants cp
-        ON cp.tenant_id = c.tenant_id
-       AND cp.conversation_id = c.id
-       AND cp.participant_type = 'tenant'
-       AND cp.participant_id = 0
+
+        LEFT JOIN conversation_participants cp
+          ON cp.tenant_id = c.tenant_id
+         AND cp.conversation_id = c.id
+         AND cp.participant_type = 'tenant'
+         AND cp.participant_id = 0
       WHERE c.tenant_id = $1
       ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC
       LIMIT 200
@@ -114,7 +103,7 @@ router.get("/conversations", async (req, res, next) => {
 /**
  * POST /api/inbox/conversations/:id/read
  * Marca conversa como lida (zera unread_count a partir de agora)
- * - Usa participant_type='tenant' e participant_id=0 (global por tenant)
+ * - participant_type='tenant' e participant_id=0 (global por tenant)
  */
 router.post("/conversations/:id/read", async (req, res, next) => {
   const client = await pool.connect();
@@ -124,10 +113,7 @@ router.post("/conversations/:id/read", async (req, res, next) => {
     const conversationId = Number(req.params.id);
 
     if (!Number.isInteger(conversationId) || conversationId <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "INVALID_CONVERSATION_ID",
-      });
+      return res.status(400).json({ ok: false, error: "INVALID_CONVERSATION_ID" });
     }
 
     await client.query("BEGIN");
@@ -145,10 +131,7 @@ router.post("/conversations/:id/read", async (req, res, next) => {
 
     if (convCheck.rowCount === 0) {
       await client.query("ROLLBACK");
-      return res.status(404).json({
-        ok: false,
-        error: "CONVERSATION_NOT_FOUND",
-      });
+      return res.status(404).json({ ok: false, error: "CONVERSATION_NOT_FOUND" });
     }
 
     await client.query(
@@ -169,30 +152,15 @@ router.post("/conversations/:id/read", async (req, res, next) => {
 
     await client.query("COMMIT");
 
-    return res.status(200).json({
-      ok: true,
-      data: {
-        tenant_id: tenantId,
-        conversation_id: conversationId,
-        last_read_at: new Date().toISOString(),
-      },
-    });
+    return res.status(200).json({ ok: true, data: { tenant_id: tenantId, conversation_id: conversationId } });
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (e) {}
+    try { await client.query("ROLLBACK"); } catch (e) {}
     return next(err);
   } finally {
     client.release();
   }
 });
 
-/**
- * GET /api/inbox/conversations/:id/messages
- * - paginado (limit/offset)
- * - ordenado por created_at ASC
- * - inclui direction
- */
 router.get("/conversations/:id/messages", async (req, res, next) => {
   try {
     const tenantId = req.tenant_id;
@@ -314,7 +282,11 @@ router.post("/conversations/:id/messages", async (req, res, next) => {
 
     try {
       if (whatsapp_jid && typeof sendTextToJid === "function") {
-        const sent = await sendTextToJid(tenantId, String(whatsapp_jid), String(content).trim());
+        const sent = await sendTextToJid(
+          tenantId,
+          String(whatsapp_jid),
+          String(content).trim()
+        );
         providerMessageId = sent?.providerMessageId || null;
       } else {
         await sendText(tenantId, phone, String(content).trim());
@@ -396,7 +368,12 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
   try {
     const tenantId = req.tenant_id;
     const contactId = Number(req.params.contact_id);
-    const { content, sender_type = "user", sender_id = null, assigned_user_id = null } = req.body;
+    const {
+      content,
+      sender_type = "user",
+      sender_id = null,
+      assigned_user_id = null,
+    } = req.body;
 
     if (!Number.isInteger(contactId) || contactId <= 0) {
       return res.status(400).json({
@@ -482,12 +459,18 @@ router.post("/contacts/:contact_id/messages", async (req, res, next) => {
       VALUES ($1, $2, $3, $4, $5)
       RETURNING *
       `,
-      [tenantId, conversation.id, sender_type, sender_id, String(content).trim()]
+      [
+        tenantId,
+        conversation.id,
+        sender_type,
+        sender_id,
+        String(content).trim(),
+      ]
     );
 
     const message = msgInsert.rows[0];
 
-    // 5) Atualiza last_message_at da conversation + preview
+    // 5) Atualiza last_message_at da conversation
     await client.query(
       `
         UPDATE conversations
