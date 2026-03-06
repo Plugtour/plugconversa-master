@@ -22,9 +22,9 @@ function ChatBody({ conversationId }) {
   useEffect(() => {
     const unsubscribe = subscribeInboxMessages((payload) => {
       const { conversation_id, message } = payload || {};
-
       if (!conversation_id || !message) return;
 
+      // ✅ correção: normaliza tipos (string/number)
       if (String(conversation_id) === String(conversationId)) {
         appendMessage(message);
       }

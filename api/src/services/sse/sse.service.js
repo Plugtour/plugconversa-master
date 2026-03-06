@@ -1,13 +1,12 @@
 /* caminho: api/src/services/sse/sse.service.js */
 
+// Mantém clientes SSE por tenant (chave normalizada em string)
 const clients = new Map();
 
 function normalizeTenantKey(tenantId) {
   const n = Number(tenantId);
-  if (Number.isInteger(n) && n > 0) {
-    return String(n);
-  }
-  return String(tenantId || "");
+  if (Number.isInteger(n) && n > 0) return String(n);
+  return String(tenantId ?? "");
 }
 
 function sseAddClient(tenantId, res) {
@@ -17,13 +16,11 @@ function sseAddClient(tenantId, res) {
     clients.set(key, new Set());
   }
 
-  const set = clients.get(key);
-  set.add(res);
+  clients.get(key).add(res);
 }
 
 function sseRemoveClient(tenantId, res) {
   const key = normalizeTenantKey(tenantId);
-
   const set = clients.get(key);
   if (!set) return;
 
@@ -36,22 +33,19 @@ function sseRemoveClient(tenantId, res) {
 
 function sseBroadcast(tenantId, eventName, payload) {
   const key = normalizeTenantKey(tenantId);
-
   const set = clients.get(key);
 
-  if (!set || set.size === 0) {
-    return;
-  }
+  if (!set || set.size === 0) return;
 
   const data = JSON.stringify(payload ?? {});
-
   for (const res of set) {
     try {
       res.write(`event: ${eventName}\n`);
       res.write(`data: ${data}\n\n`);
     } catch (err) {
+      // remove conexão morta para não acumular
       try {
-        set.delete(res);
+        sseRemoveClient(key, res);
       } catch (_) {}
     }
   }

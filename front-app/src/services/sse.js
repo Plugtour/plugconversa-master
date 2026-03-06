@@ -9,7 +9,7 @@ const listeners = new Set();
 export function connectInboxSSE() {
   if (eventSource) return eventSource;
 
-  const url = `${API_BASE}/inbox/events`;
+  const url = `${API_BASE}/inbox/events?tenant_id=1`;
 
   eventSource = new EventSource(url);
 
